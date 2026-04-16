@@ -1,0 +1,38 @@
+# Project data directories
+exports/
+TestBank/
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Node / Vite
+node_modules/
+dist/
+*.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.*

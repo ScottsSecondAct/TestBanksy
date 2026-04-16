@@ -1,0 +1,1369 @@
+#!/usr/bin/env python3
+"""
+Test Bank Manager v2 — Flask Backend
+=====================================
+Parses .docx exams via pandoc (docx→markdown), stores questions as markdown-in-JSON,
+generates formatted PDF exams with code syntax highlighting.
+
+Question types: mc, true_false, fill_blank, short_answer, essay, code_listing
+"""
+
+import json
+import os
+import re
+import uuid
+import random
+import copy
+import subprocess
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak,
+    HRFlowable, KeepTogether, Preformatted, Flowable,
+    Table, TableStyle, Image as RLImage
+)
+from reportlab.lib import colors
+from reportlab.lib.colors import HexColor
+
+app = Flask(__name__)
+CORS(app)
+
+BASE = Path(__file__).parent
+BANK_FILE = BASE / "TestBank" / "question_bank.json"
+UPLOAD_DIR = BASE / "uploads"
+EXPORT_DIR = BASE / "exports"
+LOG_FILE   = BASE / "testbank.log"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EXPORT_DIR.mkdir(exist_ok=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ════════════════════════════════════════════════════════════════════════════
+
+def log(level: str, message: str) -> None:
+    """Prepend a timestamped entry to testbank.log (latest entry at top)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] {level.upper()}: {message}\n"
+    try:
+        existing = LOG_FILE.read_text(encoding="utf-8") if LOG_FILE.exists() else ""
+        LOG_FILE.write_text(entry + existing, encoding="utf-8")
+    except Exception:
+        pass  # Never let logging crash the app
+
+
+def log_info(msg: str)    -> None: log("INFO",    msg)
+def log_success(msg: str) -> None: log("SUCCESS", msg)
+def log_error(msg: str)   -> None: log("ERROR",   msg)
+def log_warn(msg: str)    -> None: log("WARN",    msg)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DATA LAYER
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_bank():
+    if BANK_FILE.exists():
+        with open(BANK_FILE) as f:
+            bank = json.load(f)
+        # Ensure snippets list exists (v2.1 migration)
+        if "snippets" not in bank:
+            bank["snippets"] = []
+        return bank
+    return {"questions": [], "snippets": [], "metadata": {"created": datetime.now().isoformat(), "version": 2}}
+
+
+def save_bank(bank):
+    bank["metadata"]["last_modified"] = datetime.now().isoformat()
+    bank["metadata"]["version"] = 2
+    with open(BANK_FILE, "w") as f:
+        json.dump(bank, f, indent=2)
+
+
+def new_question(**kwargs):
+    """Create a question dict with all required fields."""
+    base = {
+        "id": str(uuid.uuid4()),
+        "type": "short_answer",        # mc|true_false|fill_blank|short_answer|essay|code_listing
+        "stem": "",                     # markdown — the question text
+        "choices": [],                  # for mc: [{letter, text}]
+        "correct_answer": "",           # mc: "A", true_false: "True"/"False", fill_blank: comma-separated
+        "blanks": [],                   # fill_blank: list of accepted answers per blank
+        "code_block": "",               # code_listing: the code text
+        "code_language": "asm",         # language hint for syntax highlighting
+        "essay_lines": 10,              # essay: number of blank lines on PDF
+        "points": 0,
+        "topic": "",
+        "difficulty": "medium",         # easy|medium|hard
+        "lecture": "",
+        "source": "",
+        "semester": "",
+        "number": 0,                    # original question number from source
+        "tags": [],
+        "added": datetime.now().isoformat(),
+    }
+    base.update(kwargs)
+    return base
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DOCX → MARKDOWN PARSER
+# ════════════════════════════════════════════════════════════════════════════
+
+def docx_to_markdown(filepath):
+    """Convert .docx to markdown using pandoc."""
+    result = subprocess.run(
+        ["pandoc", "--from=docx", "--to=markdown", "--wrap=none", str(filepath)],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"pandoc failed: {result.stderr}")
+    return result.stdout
+
+
+# ── Choice detection ────────────────────────────────────────────────────────
+
+CHOICE_RE = [
+    re.compile(r'^-?\s*([A-Da-d])\)\s+(.+)'),
+    re.compile(r'^-?\s*([A-Da-d])\.\s+(.+)'),
+    re.compile(r'^-?\s*([A-Da-d]):\s+(.+)'),
+]
+
+# Numeric choices (1. / 1)) only match when prefixed with '-' to avoid
+# colliding with numbered question starters like "1. What does..."
+CHOICE_NUM_RE = [
+    re.compile(r'^-\s*(\d)\)\s+(.+)'),
+    re.compile(r'^-\s*(\d)\.\s+(.+)'),
+]
+
+TF_RE = [
+    re.compile(r'^\*?\s*(?:True|False)\s*(?:/|or)\s*(?:True|False)', re.IGNORECASE),
+    re.compile(r'^\(?(?:circle|select)\s+(?:one\s*:?\s*)?(?:True|False)', re.IGNORECASE),
+]
+
+ANSWER_RE = re.compile(r'^\s*\*?\s*(?:Answer|Correct|Key|Ans)[:\s]+(.+)', re.IGNORECASE)
+BLANK_RE = re.compile(r'_{3,}|(?:\\_){3,}|\{\{blank\}\}')
+
+# Answer key section detection
+ANSWER_KEY_HDR_RE = re.compile(
+    r'^\s*#*\s*\*{0,2}\s*(?:answer\s+key|answer\s+sheet|answers|answer)\s*\*{0,2}\s*:?\s*$',
+    re.IGNORECASE,
+)
+# Entry like "1. A", "1) B", "2. True", "3: C) some text", "31. A,B,C"
+ANSWER_KEY_ENTRY_RE = re.compile(
+    r'^\s*(\d+)[.):\s]\s*([A-Da-d](?:[,\s]+[A-Da-d])*|True|False|T|F)(?:[).\s]|$)',
+    re.IGNORECASE,
+)
+
+# Section instruction: "Circle all answers that are correct" → multi_select
+MULTI_SELECT_INSTR_RE = re.compile(
+    r'^\*{0,2}\s*circle\s+\*{0,2}all\*{0,2}\s+(?:answers?\s+that\s+are\s+correct|correct\s+answers?)',
+    re.IGNORECASE,
+)
+
+
+def extract_answer_key(lines):
+    """Scan for an answer key section. Returns (dict[int, str], key_start_idx).
+    key_start_idx is the line index of the header, or -1 if none found.
+    The dict maps question number → normalized answer ('A'..'D', 'True', 'False').
+    """
+    key = {}
+    key_start = -1
+
+    for i, line in enumerate(lines):
+        if ANSWER_KEY_HDR_RE.match(line.strip()):
+            key_start = i
+            for entry in lines[i + 1:]:
+                e = entry.strip()
+                if not e:
+                    continue
+                m = ANSWER_KEY_ENTRY_RE.match(e)
+                if m:
+                    qnum = int(m.group(1))
+                    ans = m.group(2).strip()
+                    norm = {'t': 'True', 'f': 'False',
+                            'true': 'True', 'false': 'False'}
+                    normalized = norm.get(ans.lower())
+                    if normalized:
+                        key[qnum] = normalized
+                    else:
+                        # Multi-letter: "A,B,C" or "A B C" or "ABD" → "A,B,C"
+                        letters = re.findall(r'[A-Da-d]', ans)
+                        key[qnum] = ','.join(sorted(set(l.upper() for l in letters))) if letters else ans.upper()
+                # Keep iterating — allow blank lines between entries
+            break
+
+    return key, key_start
+PTS_RE = re.compile(r'[\(\[]\s*(\d+)\s*(?:pts?|points?)\s*[\)\]]', re.IGNORECASE)
+
+# Lines that are exam scaffolding, not question content — flush current question and skip
+SECTION_HDR_RE = re.compile(r'^#{1,4}\s+.+')                    # ## Section Title
+SEPARATOR_RE   = re.compile(r'^[_\-=*]{8,}\s*$')               # _______ or ------- dividers
+EXAM_NOISE_RE  = re.compile(
+    r'^(?:circle|write|select|choose|indicate|fill\s+in|answer\s+all|'
+    r'show\s+all\s+work|please\s+write|name\s*:|student\s+name|date\s*:|'
+    r'section\s*:|print\s+name|signature\s*:)',
+    re.IGNORECASE,
+)
+
+
+def detect_choice(line):
+    """Parse a line as MC choice. Returns {letter, text, is_correct} or None."""
+    s = line.strip()
+    if not s:
+        return None
+    is_correct = s.startswith("*")
+    if is_correct:
+        s = s[1:].strip()
+    for pat in CHOICE_RE:
+        m = pat.match(s)
+        if m:
+            return {"letter": m.group(1).upper(), "text": m.group(2).strip(), "is_correct": is_correct}
+    for pat in CHOICE_NUM_RE:
+        m = pat.match(s)
+        if m:
+            letter = chr(64 + int(m.group(1)))  # 1→A, 2→B, 3→C, 4→D
+            return {"letter": letter, "text": m.group(2).strip(), "is_correct": is_correct}
+    return None
+
+
+def is_true_false_marker(line):
+    """Check if a line is a True/False indicator."""
+    s = line.strip()
+    for pat in TF_RE:
+        if pat.match(s):
+            return True
+    # Simple T/F on its own line
+    if s.lower() in ("true / false", "true/false", "true or false", "t / f", "t/f"):
+        return True
+    return False
+
+
+def detect_question_type(stem, choices, code_block, tf_detected=False):
+    """Infer question type from content."""
+    # MC choices take priority even if there's also a code block
+    # (common pattern: code block + "what does this output? A) ... B) ...")
+    if choices:
+        texts = {c["text"].strip().lower() for c in choices}
+        if texts == {"true", "false"} or texts <= {"true", "false", "t", "f"}:
+            return "true_false"
+        return "mc"
+    # T/F detection from stem text
+    if tf_detected:
+        return "true_false"
+    tf_stem = re.compile(
+        r'(?:^|\b)(?:True\s*/\s*False|True\s+or\s+False|T\s*/\s*F)\b', re.IGNORECASE
+    )
+    if tf_stem.search(stem):
+        return "true_false"
+    if BLANK_RE.search(stem):
+        return "fill_blank"
+    if code_block:
+        return "code_listing"
+    return "short_answer"
+
+
+# ── Main parser ─────────────────────────────────────────────────────────────
+
+Q_START_RE = [
+    re.compile(r'^(\d+)\.\s+(.+)', re.DOTALL),
+    re.compile(r'^(\d+)\)\s+(.+)', re.DOTALL),
+    re.compile(r'^[Qq](?:uestion)?\s*(\d+)[.:]\s*(.+)', re.DOTALL),
+    re.compile(r'^\*\*(\d+)\.\*\*\s*(.+)', re.DOTALL),          # **1.** bold markdown
+    re.compile(r'^\*\*(\d+)\)\*\*\s*(.+)', re.DOTALL),          # **1)** bold markdown
+    re.compile(r'^#(\d+)[.:]\s*(.+)', re.DOTALL),
+]
+
+
+def parse_markdown_exam(md_text, source_name=""):
+    """Parse pandoc markdown output into structured questions."""
+    lines = md_text.split("\n")
+    questions = []
+
+    # Pre-scan for a standalone answer key section
+    answer_key, key_start = extract_answer_key(lines)
+    # Only parse up to the answer key header so its lines aren't treated as questions
+    if key_start >= 0:
+        lines = lines[:key_start]
+
+    current_q = None
+    stem_lines = []
+    choices = []
+    code_lines = []
+    code_lang = "asm"
+    in_code = False
+    correct_answer = None
+    tf_detected = False
+    section_type = None   # type hint from last section header (e.g. 'true_false', 'mc')
+
+    def flush():
+        nonlocal current_q, stem_lines, choices, code_lines, in_code, correct_answer, tf_detected, code_lang, section_type
+        if current_q is None:
+            return
+
+        stem = "\n".join(stem_lines).strip()
+        code_block = "\n".join(code_lines).strip() if code_lines else ""
+
+        # Clean up correct answer from starred choices
+        if not correct_answer:
+            for ch in choices:
+                if ch.pop("is_correct", False):
+                    correct_answer = ch["letter"]
+
+        # Remove is_correct flag from all choices
+        for ch in choices:
+            ch.pop("is_correct", None)
+
+        # Answer key overrides inline answers (or fills gaps where none was found)
+        qnum = current_q.get("number")
+        if qnum and qnum in answer_key:
+            correct_answer = answer_key[qnum]
+
+        # Detect type
+        qtype = detect_question_type(stem, choices, code_block, tf_detected=tf_detected)
+
+        # If content-detection gives short_answer, let the section header be the tiebreaker
+        # multi_select requires choices, so don't apply it to choice-less questions
+        if qtype == "short_answer" and section_type and section_type != "multi_select":
+            qtype = section_type
+
+        # If MC but section says "circle all", upgrade to multi_select
+        if qtype == "mc" and section_type == "multi_select":
+            qtype = "multi_select"
+
+        # Check for essay hint: "explain", "describe", "discuss", "implement" + no choices
+        essay_words = re.compile(
+            r'\b(explain|describe|discuss|compare|contrast|analyze|evaluate|justify|implement)\b',
+            re.IGNORECASE
+        )
+        if qtype == "short_answer" and essay_words.search(stem) and len(stem) > 60:
+            qtype = "essay"
+
+        # Extract blanks
+        blanks = []
+        if qtype == "fill_blank":
+            blanks = ["" for _ in BLANK_RE.findall(stem)]
+
+        # Auto-detect points
+        pts = 0
+        m = PTS_RE.search(stem)
+        if m:
+            pts = int(m.group(1))
+
+        current_q.update({
+            "stem": stem,
+            "type": qtype,
+            "choices": choices if qtype in ("mc", "multi_select") else [],
+            "correct_answer": correct_answer or "",
+            "blanks": blanks,
+            "code_block": code_block,
+            "code_language": code_lang if code_block else "asm",
+            "points": pts,
+        })
+
+        # T/F: set correct_answer format
+        if qtype == "true_false" and correct_answer:
+            ca = correct_answer.strip().lower()
+            if ca in ("t", "true"):
+                current_q["correct_answer"] = "True"
+            elif ca in ("f", "false"):
+                current_q["correct_answer"] = "False"
+
+        questions.append(current_q)
+
+        # Reset
+        current_q = None
+        stem_lines = []
+        choices = []
+        code_lines = []
+        code_lang = "asm"
+        in_code = False
+        correct_answer = None
+        tf_detected = False
+
+    for line in lines:
+        # Code fence handling
+        if in_code:
+            if line.strip().startswith("```"):
+                in_code = False
+            else:
+                code_lines.append(line)
+            continue
+
+        # Normalize pandoc artifacts: strip blockquote markers and unescape chars
+        line = re.sub(r'^(?:> ?)+', '', line)
+        line = re.sub(r'\\([)\[\]\'"\\*#\-_])', r'\1', line)
+
+        if line.strip().startswith("```"):
+            in_code = True
+            # Extract language hint
+            lang_match = re.match(r'^```\s*(\w+)', line.strip())
+            if lang_match:
+                lang = lang_match.group(1).lower()
+                # Map common variants to our asm default
+                if lang in ("asm", "nasm", "gas", "x86", "assembly", "s"):
+                    code_lang = "asm"
+                else:
+                    code_lang = lang
+            continue
+
+        # Check for new question
+        matched = False
+        for pat in Q_START_RE:
+            m = pat.match(line)
+            if m:
+                flush()
+                current_q = new_question(
+                    number=int(m.group(1)),
+                    source=source_name,
+                    semester=source_name,
+                )
+                first_text = m.group(2).strip()
+
+                # Check if first text is a choice (rare)
+                ch = detect_choice(first_text)
+                if ch:
+                    choices.append(ch)
+                else:
+                    stem_lines.append(first_text)
+                matched = True
+                break
+
+        if matched:
+            continue
+
+        # Section scaffolding — handle before the current_q guard so section_type
+        # is updated even when we're between questions (current_q is None).
+        stripped = line.strip()
+        if SECTION_HDR_RE.match(stripped):
+            flush()
+            hl = stripped.lower()
+            if "true" in hl and "false" in hl:
+                section_type = "true_false"
+            elif "multiple choice" in hl or "multiple-choice" in hl:
+                section_type = "mc"
+            elif "fill" in hl and ("blank" in hl or "in" in hl):
+                section_type = "fill_blank"
+            elif "short answer" in hl or "short-answer" in hl:
+                section_type = "short_answer"
+            elif "essay" in hl:
+                section_type = "essay"
+            else:
+                section_type = None
+            continue
+        # "Circle all answers that are correct" → multi_select section
+        if MULTI_SELECT_INSTR_RE.match(stripped):
+            flush()
+            section_type = "multi_select"
+            continue
+        if SEPARATOR_RE.match(stripped) or EXAM_NOISE_RE.match(stripped):
+            flush()
+            continue
+
+        if current_q is None:
+            continue
+
+        # Check for answer line
+        m = ANSWER_RE.match(line)
+        if m:
+            correct_answer = m.group(1).strip()
+            continue
+
+        # Check for T/F marker
+        if is_true_false_marker(line):
+            tf_detected = True
+            continue
+
+        # Check for choice
+        ch = detect_choice(line)
+        if ch:
+            choices.append(ch)
+            continue
+
+        # Otherwise it's stem text
+        stem_lines.append(line)
+
+    flush()
+    return questions
+
+
+def parse_docx(filepath, source_name=""):
+    """Full pipeline: docx → markdown → structured questions."""
+    md = docx_to_markdown(filepath)
+    return parse_markdown_exam(md, source_name=source_name)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PDF GENERATION
+# ════════════════════════════════════════════════════════════════════════════
+
+class BlankLines(Flowable):
+    """Draws N horizontal lines for essay/short answer space."""
+    def __init__(self, count=5, width=468, line_height=24):
+        super().__init__()
+        self.count = count
+        self._width = width
+        self.line_height = line_height
+        self.width = width
+        self.height = count * line_height
+
+    def draw(self):
+        self.canv.setStrokeColor(HexColor("#CCCCCC"))
+        self.canv.setLineWidth(0.5)
+        for i in range(self.count):
+            y = self.height - (i + 1) * self.line_height
+            self.canv.line(0, y, self._width, y)
+
+
+class CodeBlock(Flowable):
+    """Renders a code block with monospace font and light background."""
+    def __init__(self, code, width=468, font_size=9):
+        super().__init__()
+        self.code = code
+        self._width = width
+        self.font_size = font_size
+        self.line_height = font_size * 1.5
+        self.code_lines = code.split("\n")
+        self.padding = 8
+        self.width = width
+        self.height = len(self.code_lines) * self.line_height + self.padding * 2
+
+    def draw(self):
+        # Background
+        self.canv.setFillColor(HexColor("#F0F0F0"))
+        self.canv.setStrokeColor(HexColor("#CCCCCC"))
+        self.canv.setLineWidth(0.5)
+        self.canv.roundRect(0, 0, self._width, self.height, 4, fill=1, stroke=1)
+
+        # Code text
+        self.canv.setFillColor(HexColor("#1a1a2e"))
+        self.canv.setFont("Courier", self.font_size)
+        y = self.height - self.padding - self.font_size
+        for line in self.code_lines:
+            self.canv.drawString(self.padding + 4, y, line)
+            y -= self.line_height
+
+
+def esc(text):
+    """Escape XML special chars for reportlab Paragraph."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _inline_format(raw):
+    t = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', raw)
+    t = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', t)
+    t = re.sub(r'`(.+?)`', r'<font face="Courier" size="10">\1</font>', t)
+    t = re.sub(r'(?:\\_){3,}', '_______________', t)
+    t = re.sub(r'_{3,}', '_______________', t)
+    return t
+
+
+_INDENT_CACHE: dict = {}
+
+def _indented_style(base_style, extra_pts):
+    key = (id(base_style), extra_pts)
+    if key not in _INDENT_CACHE:
+        _INDENT_CACHE[key] = ParagraphStyle(
+            f"_ind_{id(base_style)}_{extra_pts}",
+            parent=base_style,
+            leftIndent=base_style.leftIndent + extra_pts,
+        )
+    return _INDENT_CACHE[key]
+
+
+_LIST_MARKER_RE = re.compile(r'^[-*•]|\d+[.)]')
+
+def _group_looks_like_code(lines):
+    """Return True if a group of lines should be rendered as a code block.
+
+    Criteria: more than one line, at least one has leading whitespace, and the
+    indented lines don't all look like markdown list items.
+    """
+    non_empty = [l for l in lines if l.strip()]
+    if len(non_empty) < 2:
+        return False
+    indented = [l for l in non_empty if l != l.lstrip()]
+    if not indented:
+        return False
+    # If every indented line starts with a list marker it's a bullet list, not code
+    if all(_LIST_MARKER_RE.match(l.lstrip()) for l in indented):
+        return False
+    return True
+
+
+def stem_to_paragraphs(stem, style, code_style_width=468):
+    """Convert markdown stem to reportlab flowables.
+
+    Fenced code blocks (```...```) → CodeBlock.
+    Groups of lines that look like code (indented, non-list) → CodeBlock.
+    Bullet-list indented lines → Paragraphs with leftIndent.
+    Everything else → Paragraph per logical paragraph.
+    """
+    elements = []
+    blocks = re.split(r'(```[\s\S]*?```)', stem)
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        if block.startswith("```") and block.endswith("```"):
+            inner = block[3:]
+            if inner.endswith("```"):
+                inner = inner[:-3]
+            lines = inner.split("\n")
+            if lines and re.match(r'^\w+$', lines[0].strip()):
+                lines = lines[1:]
+            code_text = "\n".join(lines).strip()
+            if code_text:
+                elements.append(Spacer(1, 4))
+                elements.append(CodeBlock(code_text, width=code_style_width))
+                elements.append(Spacer(1, 4))
+        else:
+            # Split into groups of consecutive non-blank lines
+            raw_lines = block.split("\n")
+            group: list[str] = []
+
+            def flush_group():
+                if not group:
+                    return
+                if _group_looks_like_code(group):
+                    elements.append(Spacer(1, 4))
+                    elements.append(CodeBlock("\n".join(group), width=code_style_width))
+                    elements.append(Spacer(1, 4))
+                else:
+                    for line in group:
+                        expanded = line.expandtabs(4)
+                        leading = len(expanded) - len(expanded.lstrip())
+                        indent_pts = (leading // 4) * 14
+                        formatted = _inline_format(esc(expanded.lstrip()))
+                        s = _indented_style(style, indent_pts) if indent_pts else style
+                        elements.append(Paragraph(formatted, s))
+
+            for line in raw_lines:
+                if line.strip():
+                    group.append(line)
+                else:
+                    flush_group()
+                    group = []
+                    elements.append(Spacer(1, 4))
+
+            flush_group()
+
+    return elements
+
+
+def frontmatter_to_flowables(markdown_text, content_width, styles):
+    """Convert front matter markdown to reportlab flowables.
+
+    Supports:
+    - Markdown tables (pipe-delimited)
+    - Code blocks (``` fenced)
+    - Headings (# ## ###)
+    - Bold, italic, inline code
+    - Images: ![alt](path) — local file paths or base64
+    - Page breaks: ---pagebreak--- on its own line
+    - Horizontal rules: --- on its own line
+    - Figure captions: *Figure N: caption* after images
+    """
+    if not markdown_text or not markdown_text.strip():
+        return []
+
+    elements = []
+    lines = markdown_text.split("\n")
+    i = 0
+
+    s_h1 = ParagraphStyle("FMH1", parent=styles["Heading1"], fontSize=16, spaceBefore=12, spaceAfter=6)
+    s_h2 = ParagraphStyle("FMH2", parent=styles["Heading2"], fontSize=14, spaceBefore=10, spaceAfter=5)
+    s_h3 = ParagraphStyle("FMH3", parent=styles["Heading3"], fontSize=12, spaceBefore=8, spaceAfter=4)
+    s_body = ParagraphStyle("FMBody", parent=styles["Normal"], fontSize=11, spaceAfter=4, leading=14)
+    s_caption = ParagraphStyle("FMCaption", parent=styles["Normal"], fontSize=10, spaceAfter=8,
+                               alignment=TA_CENTER, italic=True, textColor=HexColor("#555555"))
+    s_tbl_header = ParagraphStyle("FMTblH", parent=styles["Normal"], fontSize=10, leading=12,
+                                  fontName="Helvetica-Bold")
+    s_tbl_cell = ParagraphStyle("FMTblC", parent=styles["Normal"], fontSize=10, leading=12)
+
+    def inline_format(text):
+        """Apply inline markdown formatting."""
+        t = esc(text)
+        t = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', t)
+        t = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', t)
+        t = re.sub(r'`(.+?)`', r'<font face="Courier" size="9">\1</font>', t)
+        return t
+
+    def parse_table(start_idx):
+        """Parse a markdown pipe table starting at start_idx. Returns (flowable, end_idx)."""
+        rows = []
+        idx = start_idx
+        has_separator = False
+
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if not line.startswith("|"):
+                break
+            # Check for separator row (|---|---|)
+            if re.match(r'^\|[\s\-:]+\|', line):
+                has_separator = True
+                idx += 1
+                continue
+            cells = [c.strip() for c in line.split("|")[1:-1]]  # strip outer pipes
+            rows.append(cells)
+            idx += 1
+
+        if not rows:
+            return None, start_idx
+
+        # Build table
+        max_cols = max(len(r) for r in rows)
+        # Pad rows to same length
+        for r in rows:
+            while len(r) < max_cols:
+                r.append("")
+
+        # First row is header if separator follows
+        table_data = []
+        for ri, row in enumerate(rows):
+            style = s_tbl_header if ri == 0 and has_separator else s_tbl_cell
+            table_data.append([Paragraph(inline_format(cell), style) for cell in row])
+
+        col_width = content_width / max_cols
+        col_widths = [col_width] * max_cols
+
+        tbl = Table(table_data, colWidths=col_widths)
+        tbl_style = [
+            ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#CCCCCC")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]
+        if has_separator and len(table_data) > 0:
+            tbl_style.append(("BACKGROUND", (0, 0), (-1, 0), HexColor("#E8E8E8")))
+            tbl_style.append(("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"))
+
+        tbl.setStyle(TableStyle(tbl_style))
+        return tbl, idx
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Page break
+        if stripped.lower() in ("---pagebreak---", "---page break---", "<!-- pagebreak -->"):
+            elements.append(PageBreak())
+            i += 1
+            continue
+
+        # Horizontal rule
+        if re.match(r'^-{3,}$', stripped) or re.match(r'^\*{3,}$', stripped):
+            elements.append(Spacer(1, 6))
+            elements.append(HRFlowable(width="100%", thickness=1, color=HexColor("#999999")))
+            elements.append(Spacer(1, 6))
+            i += 1
+            continue
+
+        # Code block
+        if stripped.startswith("```"):
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing ```
+            if code_lines:
+                elements.append(Spacer(1, 4))
+                elements.append(CodeBlock("\n".join(code_lines), width=int(content_width)))
+                elements.append(Spacer(1, 4))
+            continue
+
+        # Table
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            tbl, new_i = parse_table(i)
+            if tbl:
+                elements.append(Spacer(1, 6))
+                elements.append(tbl)
+                elements.append(Spacer(1, 6))
+                i = new_i
+                continue
+
+        # Image: ![alt](path)
+        img_match = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)', stripped)
+        if img_match:
+            alt_text = img_match.group(1)
+            img_path = img_match.group(2)
+            try:
+                # Support both absolute paths and paths relative to uploads
+                if not os.path.isabs(img_path):
+                    img_path = str(UPLOAD_DIR / img_path)
+                if os.path.exists(img_path):
+                    img = RLImage(img_path)
+                    # Scale to fit content width while preserving aspect ratio
+                    iw, ih = img.drawWidth, img.drawHeight
+                    if iw > content_width:
+                        scale = content_width / iw
+                        img.drawWidth = content_width
+                        img.drawHeight = ih * scale
+                    elements.append(Spacer(1, 6))
+                    elements.append(img)
+                    # Check next line for caption (*Figure N: ...*)
+                    if i + 1 < len(lines):
+                        cap = lines[i + 1].strip()
+                        if cap.startswith("*") and cap.endswith("*"):
+                            elements.append(Paragraph(inline_format(cap[1:-1]), s_caption))
+                            i += 1
+                    elements.append(Spacer(1, 6))
+                else:
+                    elements.append(Paragraph(f"<i>[Image not found: {esc(img_path)}]</i>", s_body))
+            except Exception as e:
+                elements.append(Paragraph(f"<i>[Image error: {esc(str(e))}]</i>", s_body))
+            i += 1
+            continue
+
+        # Headings
+        if stripped.startswith("### "):
+            elements.append(Paragraph(inline_format(stripped[4:]), s_h3))
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            elements.append(Paragraph(inline_format(stripped[3:]), s_h2))
+            i += 1
+            continue
+        if stripped.startswith("# "):
+            elements.append(Paragraph(inline_format(stripped[2:]), s_h1))
+            i += 1
+            continue
+
+        # Empty line
+        if not stripped:
+            elements.append(Spacer(1, 4))
+            i += 1
+            continue
+
+        # Regular paragraph
+        elements.append(Paragraph(inline_format(stripped), s_body))
+        i += 1
+
+    return elements
+
+
+def generate_exam_pdf(questions, config):
+    """Generate formatted PDF exam from selected questions."""
+    filename = config.get("filename", "exam.pdf")
+    title = config.get("title", "Exam")
+    course = config.get("course", "")
+    date_str = config.get("date", "")
+    instructions = config.get("instructions", "")
+    show_points = config.get("show_points", True)
+    shuffle_choices = config.get("shuffle_choices", False)
+    generate_key = config.get("generate_key", False)
+    front_matter = config.get("front_matter", "")
+    front_matter_own_page = config.get("front_matter_own_page", True)
+    total_points = sum(q.get("points", 0) for q in questions)
+
+    exam_qs = copy.deepcopy(questions)
+    answer_key = []
+
+    # Shuffle MC / multi_select choices
+    if shuffle_choices:
+        for q in exam_qs:
+            if q["type"] in ("mc", "multi_select") and q.get("choices"):
+                if q["type"] == "multi_select":
+                    # Track multiple correct letters by text
+                    correct_letters = set(q.get("correct_answer", "").replace(" ", "").split(","))
+                    correct_texts = {ch["text"] for ch in q["choices"] if ch["letter"] in correct_letters}
+                    random.shuffle(q["choices"])
+                    for i, ch in enumerate(q["choices"]):
+                        ch["letter"] = chr(65 + i)
+                    q["correct_answer"] = ",".join(sorted(
+                        ch["letter"] for ch in q["choices"] if ch["text"] in correct_texts
+                    ))
+                else:
+                    correct_letter = q.get("correct_answer", "")
+                    correct_text = next(
+                        (ch["text"] for ch in q["choices"] if ch["letter"] == correct_letter), None
+                    )
+                    random.shuffle(q["choices"])
+                    for i, ch in enumerate(q["choices"]):
+                        ch["letter"] = chr(65 + i)
+                    if correct_text:
+                        for ch in q["choices"]:
+                            if ch["text"] == correct_text:
+                                q["correct_answer"] = ch["letter"]
+                                break
+
+    # Build answer key
+    for i, q in enumerate(exam_qs, 1):
+        ca = q.get("correct_answer", "")
+        if ca:
+            if q["type"] in ("mc", "multi_select"):
+                answer_key.append({"num": i, "answer": ca, "type": "mc"})
+            elif q["type"] == "true_false":
+                answer_key.append({"num": i, "answer": ca, "type": "tf"})
+            elif q["type"] == "fill_blank" and q.get("blanks"):
+                answer_key.append({"num": i, "answer": ", ".join(q["blanks"]) if any(q["blanks"]) else ca, "type": "fill"})
+
+    filepath = EXPORT_DIR / filename
+    content_width = 6.5 * inch  # 8.5 - 2 margins
+
+    doc = SimpleDocTemplate(
+        str(filepath), pagesize=letter,
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
+        leftMargin=1 * inch, rightMargin=1 * inch
+    )
+
+    styles = getSampleStyleSheet()
+    s_title = ParagraphStyle("T", parent=styles["Title"], fontSize=18, spaceAfter=6, alignment=TA_CENTER)
+    s_sub = ParagraphStyle("Sub", parent=styles["Normal"], fontSize=12, spaceAfter=4, alignment=TA_CENTER)
+    s_info = ParagraphStyle("Info", parent=styles["Normal"], fontSize=11, spaceAfter=2)
+    s_instr = ParagraphStyle("Instr", parent=styles["Normal"], fontSize=10, spaceAfter=12, spaceBefore=8,
+                             leftIndent=12, rightIndent=12, italic=True)
+    s_qnum = ParagraphStyle("QNum", parent=styles["Normal"], fontSize=11, spaceBefore=14, spaceAfter=4)
+    s_stem = ParagraphStyle("Stem", parent=styles["Normal"], fontSize=11, spaceAfter=3, leftIndent=20)
+    s_choice = ParagraphStyle("Ch", parent=styles["Normal"], fontSize=11, spaceAfter=2, leftIndent=36)
+    s_tf = ParagraphStyle("TF", parent=styles["Normal"], fontSize=11, spaceAfter=2, leftIndent=36)
+    s_key_title = ParagraphStyle("KT", parent=styles["Heading2"], fontSize=14, spaceAfter=10, alignment=TA_CENTER)
+    s_key = ParagraphStyle("KE", parent=styles["Normal"], fontSize=11, spaceAfter=2, leftIndent=36, fontName="Courier")
+
+    story = []
+
+    # ── Header ──────────────────────────────────────────────────
+    story.append(Paragraph(esc(title), s_title))
+    if course:
+        story.append(Paragraph(esc(course), s_sub))
+    if date_str:
+        story.append(Paragraph(esc(date_str), s_sub))
+    story.append(Spacer(1, 8))
+
+    name_line = "Name: ________________________________________"
+    if show_points and total_points > 0:
+        name_line += f"&nbsp;&nbsp;&nbsp;&nbsp;Score: ______ / {total_points}"
+    story.append(Paragraph(name_line, s_info))
+    story.append(Spacer(1, 6))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+    story.append(Spacer(1, 6))
+
+    if instructions:
+        story.append(Paragraph(f"<i>{esc(instructions)}</i>", s_instr))
+        story.append(Spacer(1, 4))
+
+    # ── Front Matter ────────────────────────────────────────────
+    if front_matter and front_matter.strip():
+        fm_elems = frontmatter_to_flowables(front_matter, content_width, styles)
+        if fm_elems:
+            story.extend(fm_elems)
+            if front_matter_own_page:
+                story.append(PageBreak())
+            else:
+                story.append(Spacer(1, 12))
+                story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+                story.append(Spacer(1, 8))
+
+    # ── Questions ───────────────────────────────────────────────
+    for i, q in enumerate(exam_qs, 1):
+        elems = []
+        pts = ""
+        if show_points and q.get("points", 0) > 0:
+            pts = f" <i>({q['points']} pts)</i>"
+
+        qtype = q.get("type", "short_answer")
+        type_label = {
+            "mc": "", "multi_select": "[Circle all that apply]",
+            "true_false": "[T/F]", "fill_blank": "[Fill in the Blank]",
+            "short_answer": "", "essay": "[Essay]", "code_listing": "",
+        }.get(qtype, "")
+
+        if type_label:
+            type_label = f' <font size="9" color="#666666">{type_label}</font>'
+
+        # Question number line
+        stem_first_line = q["stem"].split("\n")[0] if q["stem"] else ""
+        # We'll render the number, then the full stem via stem_to_paragraphs
+        elems.append(Paragraph(f"<b>{i}.</b>{pts}{type_label}", s_qnum))
+
+        # Stem
+        stem_elems = stem_to_paragraphs(q["stem"], s_stem, code_style_width=int(content_width - 20))
+        elems.extend(stem_elems)
+
+        # Code block (dedicated field, separate from stem)
+        if q.get("code_block"):
+            elems.append(Spacer(1, 4))
+            elems.append(CodeBlock(q["code_block"], width=int(content_width - 20)))
+            elems.append(Spacer(1, 4))
+
+        # Type-specific rendering
+        if qtype in ("mc", "multi_select") and q.get("choices"):
+            elems.append(Spacer(1, 4))
+            for ch in q["choices"]:
+                elems.append(Paragraph(
+                    f"<b>{ch['letter']}.</b>&nbsp;&nbsp;{esc(ch['text'])}", s_choice
+                ))
+
+        elif qtype == "true_false":
+            elems.append(Spacer(1, 4))
+            elems.append(Paragraph("<b>True</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>False</b>", s_tf))
+
+        elif qtype == "fill_blank":
+            pass  # blanks are rendered inline via underlines in the stem
+
+        # For answer-space types, keep the question itself together then add
+        # BlankLines outside KeepTogether so a large blank area can start on
+        # the next page without crashing if it exceeds the frame height.
+        blank_lines = None
+        if qtype == "essay":
+            blank_lines = min(q.get("essay_lines", 10), 25)
+        elif qtype == "short_answer":
+            blank_lines = min(q.get("essay_lines", 3), 25)
+
+        elems.append(Spacer(1, 10))
+        story.append(KeepTogether(elems))
+
+        if blank_lines:
+            story.append(Spacer(1, 6))
+            story.append(BlankLines(count=blank_lines, width=int(content_width)))
+            story.append(Spacer(1, 10))
+
+    # ── Answer Key ──────────────────────────────────────────────
+    if generate_key and answer_key:
+        story.append(PageBreak())
+        story.append(Paragraph("Answer Key", s_key_title))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+        story.append(Spacer(1, 10))
+        for entry in answer_key:
+            story.append(Paragraph(
+                f"<b>{entry['num']}.</b>&nbsp;&nbsp;{esc(entry['answer'])}", s_key
+            ))
+
+    doc.build(story)
+    return filepath
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# API ROUTES
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok", "version": 2})
+
+
+@app.route("/api/questions")
+def get_questions():
+    return jsonify(load_bank()["questions"])
+
+
+@app.route("/api/questions/<qid>", methods=["PUT"])
+def update_question(qid):
+    bank = load_bank()
+    data = request.json
+    for i, q in enumerate(bank["questions"]):
+        if q["id"] == qid:
+            bank["questions"][i].update(data)
+            save_bank(bank)
+            fields = ", ".join(data.keys())
+            log_info(f"Question {qid[:8]}… updated fields: {fields}")
+            return jsonify(bank["questions"][i])
+    log_warn(f"Question update failed — ID not found: {qid}")
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/questions/<qid>", methods=["DELETE"])
+def delete_question(qid):
+    bank = load_bank()
+    bank["questions"] = [q for q in bank["questions"] if q["id"] != qid]
+    save_bank(bank)
+    log_info(f"Question deleted: {qid[:8]}…")
+    return jsonify({"status": "deleted"})
+
+
+@app.route("/api/questions", methods=["POST"])
+def add_question():
+    """Manually add a new question."""
+    data = request.json
+    q = new_question(**data)
+    bank = load_bank()
+    bank["questions"].append(q)
+    save_bank(bank)
+    log_success(f"Question created manually: type={q['type']}, topic='{q.get('topic', '')}', id={q['id'][:8]}…")
+    return jsonify(q), 201
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_docx():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    file = request.files["file"]
+    source = request.form.get("source", file.filename)
+
+    if not file.filename.lower().endswith(".docx"):
+        return jsonify({"error": "Only .docx files supported"}), 400
+
+    filepath = UPLOAD_DIR / file.filename
+    file.save(str(filepath))
+
+    try:
+        new_qs = parse_docx(str(filepath), source_name=source)
+    except Exception as e:
+        log_error(f"Docx parse failed for '{file.filename}': {e}")
+        return jsonify({"error": f"Parse failed: {e}"}), 500
+
+    bank = load_bank()
+    bank["questions"].extend(new_qs)
+    save_bank(bank)
+
+    type_counts = {}
+    for q in new_qs:
+        t = q["type"]
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    summary = ", ".join(f"{v} {k}" for k, v in type_counts.items())
+    log_success(f"Imported {len(new_qs)} questions from docx '{source}' ({summary})")
+    return jsonify({
+        "status": "success",
+        "questions_added": len(new_qs),
+        "type_counts": type_counts,
+        "total_questions": len(bank["questions"]),
+        "questions": new_qs,
+    })
+
+
+@app.route("/api/upload-markdown", methods=["POST"])
+def upload_markdown():
+    """Upload raw markdown text for parsing."""
+    data = request.json
+    md_text = data.get("markdown", "")
+    source = data.get("source", "Manual Import")
+
+    if not md_text.strip():
+        log_warn("Markdown import attempted with empty content")
+        return jsonify({"error": "Empty markdown"}), 400
+
+    try:
+        new_qs = parse_markdown_exam(md_text, source_name=source)
+    except Exception as e:
+        log_error(f"Markdown parse failed for source '{source}': {e}")
+        return jsonify({"error": f"Parse failed: {e}"}), 500
+
+    bank = load_bank()
+    bank["questions"].extend(new_qs)
+    save_bank(bank)
+
+    log_success(f"Imported {len(new_qs)} questions from markdown source '{source}'")
+    return jsonify({
+        "status": "success",
+        "questions_added": len(new_qs),
+        "questions": new_qs,
+    })
+
+
+@app.route("/api/upload-answer-key", methods=["POST"])
+def upload_answer_key():
+    """Apply a separate answer key file (.docx or .md) to questions already in the bank.
+
+    Matches by source name (form field 'source') + question number.
+    Returns the count of questions updated.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    source = request.form.get("source", "").strip()
+    fname = file.filename.lower()
+
+    # Parse the key file into markdown text
+    if fname.endswith(".docx"):
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        file.save(tmp.name)
+        try:
+            md_text = docx_to_markdown(tmp.name)
+        except Exception as e:
+            return jsonify({"error": f"pandoc failed: {e}"}), 500
+        finally:
+            os.unlink(tmp.name)
+    elif fname.endswith((".md", ".markdown", ".txt")):
+        md_text = file.read().decode("utf-8", errors="replace")
+    else:
+        return jsonify({"error": "Unsupported file type. Use .docx or .md"}), 400
+
+    lines = md_text.split("\n")
+    key, _ = extract_answer_key(lines)
+
+    # If no key section header found, try parsing the whole file as key entries
+    if not key:
+        for line in lines:
+            m = ANSWER_KEY_ENTRY_RE.match(line.strip())
+            if m:
+                qnum = int(m.group(1))
+                ans = m.group(2).strip()
+                norm = {'t': 'True', 'f': 'False', 'true': 'True', 'false': 'False'}
+                key[qnum] = norm.get(ans.lower(), ans.upper())
+
+    if not key:
+        log_warn(f"Answer key file '{file.filename}' contained no recognizable entries")
+        return jsonify({"error": "No answer key entries found in file"}), 400
+
+    bank = load_bank()
+    updated = 0
+    for q in bank["questions"]:
+        if source and q.get("source", "").strip().lower() != source.lower():
+            continue
+        qnum = q.get("number")
+        if qnum and qnum in key:
+            q["correct_answer"] = key[qnum]
+            updated += 1
+
+    if updated:
+        save_bank(bank)
+
+    scope = f"source '{source}'" if source else "all sources"
+    log_success(f"Answer key '{file.filename}' applied: {updated} questions updated ({len(key)} key entries, {scope})")
+    return jsonify({
+        "status": "success",
+        "key_entries": len(key),
+        "questions_updated": updated,
+    })
+
+
+@app.route("/api/generate-pdf", methods=["POST"])
+def generate_pdf():
+    data = request.json
+    qids = data.get("question_ids", [])
+    config = data.get("config", {})
+
+    bank = load_bank()
+    id_map = {q["id"]: q for q in bank["questions"]}
+    selected = [id_map[qid] for qid in qids if qid in id_map]
+
+    if not selected:
+        log_warn(f"PDF generation attempted with no valid question IDs ({len(qids)} requested)")
+        return jsonify({"error": "No valid questions selected"}), 400
+
+    try:
+        fp = generate_exam_pdf(selected, config)
+        log_success(f"PDF generated: '{config.get('filename', 'exam.pdf')}' ({len(selected)} questions)")
+        return send_file(str(fp), as_attachment=True, download_name=config.get("filename", "exam.pdf"))
+    except Exception as e:
+        log_error(f"PDF generation failed for '{config.get('filename', 'exam.pdf')}': {e}")
+        return jsonify({"error": f"PDF failed: {e}"}), 500
+
+
+@app.route("/api/stats")
+def get_stats():
+    bank = load_bank()
+    qs = bank["questions"]
+    types = {}
+    diffs = {}
+    for q in qs:
+        t = q.get("type", "short_answer")
+        types[t] = types.get(t, 0) + 1
+        d = q.get("difficulty", "medium")
+        diffs[d] = diffs.get(d, 0) + 1
+
+    return jsonify({
+        "total": len(qs),
+        "types": types,
+        "difficulties": diffs,
+        "topics": sorted(set(q.get("topic", "") for q in qs if q.get("topic"))),
+        "sources": sorted(set(q.get("source", "") for q in qs if q.get("source"))),
+        "lectures": sorted(set(q.get("lecture", "") for q in qs if q.get("lecture"))),
+    })
+
+
+@app.route("/api/export-bank")
+def export_bank():
+    return send_file(str(BANK_FILE), as_attachment=True, download_name="question_bank.json")
+
+
+@app.route("/api/import-bank", methods=["POST"])
+def import_bank():
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+    data = json.load(request.files["file"])
+    if "questions" not in data:
+        return jsonify({"error": "Invalid format"}), 400
+    save_bank(data)
+    return jsonify({"status": "imported", "count": len(data["questions"])})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SNIPPET ROUTES (Front Matter Library)
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/snippets")
+def get_snippets():
+    bank = load_bank()
+    return jsonify(bank.get("snippets", []))
+
+
+@app.route("/api/snippets", methods=["POST"])
+def create_snippet():
+    data = request.json
+    snippet = {
+        "id": str(uuid.uuid4()),
+        "title": data.get("title", "Untitled"),
+        "category": data.get("category", "general"),
+        "markdown": data.get("markdown", ""),
+        "created": datetime.now().isoformat(),
+    }
+    bank = load_bank()
+    bank["snippets"].append(snippet)
+    save_bank(bank)
+    return jsonify(snippet), 201
+
+
+@app.route("/api/snippets/<sid>", methods=["PUT"])
+def update_snippet(sid):
+    bank = load_bank()
+    data = request.json
+    for i, s in enumerate(bank["snippets"]):
+        if s["id"] == sid:
+            bank["snippets"][i].update(data)
+            save_bank(bank)
+            return jsonify(bank["snippets"][i])
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/snippets/<sid>", methods=["DELETE"])
+def delete_snippet(sid):
+    bank = load_bank()
+    bank["snippets"] = [s for s in bank["snippets"] if s["id"] != sid]
+    save_bank(bank)
+    return jsonify({"status": "deleted"})
+
+
+@app.route("/api/upload-image", methods=["POST"])
+def upload_image():
+    """Upload an image file for use in front matter."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+    file = request.files["file"]
+    ext = Path(file.filename).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+        return jsonify({"error": "Unsupported image format"}), 400
+    safe_name = re.sub(r'[^\w\-.]', '_', file.filename)
+    filepath = UPLOAD_DIR / safe_name
+    file.save(str(filepath))
+    log_info(f"Image uploaded: {safe_name}")
+    return jsonify({
+        "status": "uploaded",
+        "filename": safe_name,
+        "path": str(filepath),
+        "markdown_ref": f"![{Path(safe_name).stem}]({safe_name})",
+    })
+
+
+if __name__ == "__main__":
+    print("Test Bank Manager v2")
+    print(f"Bank: {BANK_FILE}")
+    print(f"Uploads: {UPLOAD_DIR}")
+    print(f"Exports: {EXPORT_DIR}")
+    log_info(f"Server started — bank: {BANK_FILE}")
+    app.run(debug=True, port=5000)
