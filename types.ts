@@ -9,6 +9,14 @@ export type QuestionType =
 
 export type Difficulty = 'easy' | 'medium' | 'hard';
 
+export type BloomLevel =
+  | 'remember'
+  | 'understand'
+  | 'apply'
+  | 'analyze'
+  | 'evaluate'
+  | 'create';
+
 export interface Choice {
   letter: string;
   text: string;
@@ -33,6 +41,11 @@ export interface Question {
   number: number;
   tags: string[];
   added: string;
+  notes: string;
+  flagged: boolean;
+  bloom: BloomLevel | '';
+  objectives: string[];
+  empirical_difficulty: number | null;
 }
 
 /** A question being composed — no server-assigned fields yet. */
@@ -75,11 +88,13 @@ export interface Filters {
   lecture: string;
   type: string;
   answered: '' | 'yes' | 'no';
+  flagged: '' | 'yes' | 'no';
+  bloom: string;
 }
 
 export type ToastState = { msg: string; type: 'success' | 'error' } | null;
 
-export type View = 'bank' | 'upload' | 'frontmatter' | 'generate';
+export type View = 'bank' | 'upload' | 'frontmatter' | 'generate' | 'stats';
 
 export interface BankInfo {
   id: string;
@@ -105,4 +120,24 @@ export interface DuplicatePair {
   score: number;
   a: Question;
   b: Question;
+}
+
+export interface ExamTemplate {
+  id: string;
+  name: string;
+  config: Partial<PdfConfig>;
+  front_matter: string;
+  created: string;
+}
+
+export interface SmartCollection {
+  id: string;
+  name: string;
+  filters: Filters;
+}
+
+export interface UndoEntry {
+  action: 'delete' | 'bulk_delete';
+  questions: Question[];
+  label: string;
 }

@@ -131,8 +131,11 @@ def load_bank():
             bank["snippets"] = []
         if "exams" not in bank:
             bank["exams"] = []
+        if "templates" not in bank:
+            bank["templates"] = []
         return bank
-    return {"questions": [], "snippets": [], "exams": [], "metadata": {"created": datetime.now().isoformat(), "version": 2}}
+    return {"questions": [], "snippets": [], "exams": [], "templates": [],
+            "metadata": {"created": datetime.now().isoformat(), "version": 2}}
 
 
 def save_bank(bank):
@@ -179,6 +182,11 @@ def new_question(**kwargs):
         "number": 0,                    # original question number from source
         "tags": [],
         "added": datetime.now().isoformat(),
+        "notes": "",                    # private notes, not printed
+        "flagged": False,               # flagged for review
+        "bloom": "",                    # Bloom's taxonomy level
+        "objectives": [],               # learning objective tags
+        "empirical_difficulty": None,   # pct_correct from calibration (0-1)
     }
     base.update(kwargs)
     return base
@@ -383,6 +391,16 @@ def is_true_false_marker(line):
     return False
 
 
+_MULTI_SELECT_STEM_RE = re.compile(
+    r'\b(select\s+all|choose\s+all|check\s+all|mark\s+all|circle\s+all'
+    r'|all\s+that\s+apply|all\s+of\s+the\s+above\s+that\s+apply'
+    r'|which\s+(?:of\s+the\s+following\s+)?(?:statements?\s+)?are\s+(?:true|correct)'
+    r'|may\s+have\s+more\s+than\s+one\s+(?:correct\s+)?answer'
+    r'|more\s+than\s+one\s+(?:answer\s+)?(?:is\s+)?correct)\b',
+    re.IGNORECASE,
+)
+
+
 def detect_question_type(stem, choices, code_block, tf_detected=False):
     """Infer question type from content."""
     # MC choices take priority even if there's also a code block
@@ -391,6 +409,8 @@ def detect_question_type(stem, choices, code_block, tf_detected=False):
         texts = {c["text"].strip().lower() for c in choices}
         if texts == {"true", "false"} or texts <= {"true", "false", "t", "f"}:
             return "true_false"
+        if _MULTI_SELECT_STEM_RE.search(stem):
+            return "multi_select"
         return "mc"
     # T/F detection from stem text
     if tf_detected:
@@ -448,11 +468,17 @@ def parse_markdown_exam(md_text, source_name=""):
         stem = "\n".join(stem_lines).strip()
         code_block = "\n".join(code_lines).strip() if code_lines else ""
 
+        # Collect all starred choices before stripping the flag
+        starred_letters = [ch["letter"] for ch in choices if ch.get("is_correct")]
+
         # Clean up correct answer from starred choices
         if not correct_answer:
             for ch in choices:
                 if ch.pop("is_correct", False):
                     correct_answer = ch["letter"]
+        else:
+            for ch in choices:
+                ch.pop("is_correct", None)
 
         # Remove is_correct flag from all choices
         for ch in choices:
@@ -473,6 +499,15 @@ def parse_markdown_exam(md_text, source_name=""):
 
         # If MC but section says "circle all", upgrade to multi_select
         if qtype == "mc" and section_type == "multi_select":
+            qtype = "multi_select"
+
+        # Multiple starred choices in the source doc → must be multi_select
+        if qtype == "mc" and len(starred_letters) > 1:
+            qtype = "multi_select"
+            correct_answer = ",".join(sorted(set(starred_letters)))
+
+        # Comma-separated answer (from key file) with choices → multi_select
+        if qtype == "mc" and correct_answer and "," in str(correct_answer):
             qtype = "multi_select"
 
         # Check for essay hint: "explain", "describe", "discuss", "implement" + no choices
@@ -1432,25 +1467,68 @@ def upload_answer_key():
         log_warn(f"Answer key file '{file.filename}' contained no recognizable entries")
         return jsonify({"error": "No answer key entries found in file"}), 400
 
+    fuzzy = request.form.get("fuzzy", "false").lower() in ("1", "true", "yes")
+    fuzzy_threshold = float(request.form.get("fuzzy_threshold", "0.72"))
+
     bank = load_bank()
     updated = 0
-    for q in bank["questions"]:
-        if source and q.get("source", "").strip().lower() != source.lower():
-            continue
-        qnum = q.get("number")
-        if qnum and qnum in key:
-            q["correct_answer"] = key[qnum]
-            updated += 1
+    unmatched: list = []
+
+    fuzzy_key_count = 0
+    if fuzzy:
+        # Fuzzy mode: re-parse the uploaded document as a full exam (stems + answers),
+        # then for each parsed question find the closest bank question by stem similarity.
+        # This handles version drift where question numbers changed but text is still similar.
+        parsed = parse_markdown_exam(md_text, source_name=source or file.filename)
+        key_questions = [q for q in parsed if q.get("correct_answer")]
+        fuzzy_key_count = len(key_questions)
+
+        pool = [
+            q for q in bank["questions"]
+            if not source or q.get("source", "").strip().lower() == source.lower()
+        ]
+        matched_ids: set = set()
+
+        for kq in key_questions:
+            kq_stem = kq.get("stem", "")
+            if not kq_stem:
+                continue
+            best_score = 0.0
+            best_q = None
+            for candidate in pool:
+                if candidate["id"] in matched_ids:
+                    continue
+                score = stem_similarity(kq_stem, candidate.get("stem", ""))
+                if score > best_score:
+                    best_score = score
+                    best_q = candidate
+            if best_q and best_score >= fuzzy_threshold:
+                best_q["correct_answer"] = kq["correct_answer"]
+                matched_ids.add(best_q["id"])
+                updated += 1
+            else:
+                unmatched.append(kq.get("number") or kq_stem[:60])
+    else:
+        for q in bank["questions"]:
+            if source and q.get("source", "").strip().lower() != source.lower():
+                continue
+            qnum = q.get("number")
+            if qnum and qnum in key:
+                q["correct_answer"] = key[qnum]
+                updated += 1
 
     if updated:
         save_bank(bank)
 
     scope = f"source '{source}'" if source else "all sources"
-    log_success(f"Answer key '{file.filename}' applied: {updated} questions updated ({len(key)} key entries, {scope})")
+    mode = f"fuzzy (threshold={fuzzy_threshold})" if fuzzy else "exact"
+    log_success(f"Answer key '{file.filename}' applied [{mode}]: {updated} questions updated ({len(key)} key entries, {scope})")
     return jsonify({
         "status": "success",
-        "key_entries": len(key),
+        "key_entries": fuzzy_key_count if fuzzy else len(key),
         "questions_updated": updated,
+        "unmatched_count": len(unmatched),
+        "mode": mode,
     })
 
 
@@ -1710,6 +1788,322 @@ def upload_image():
         "path": str(filepath),
         "markdown_ref": f"![{Path(safe_name).stem}]({safe_name})",
     })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BULK UPDATE
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/questions/bulk-update", methods=["POST"])
+def bulk_update_questions():
+    data = request.json
+    ids = set(data.get("ids", []))
+    fields = data.get("fields", {})
+    if not ids or not fields:
+        return jsonify({"error": "ids and fields required"}), 400
+    bank = load_bank()
+    updated = 0
+    for q in bank["questions"]:
+        if q["id"] in ids:
+            q.update(fields)
+            updated += 1
+    save_bank(bank)
+    log_info(f"Bulk updated {updated} questions: {', '.join(fields.keys())}")
+    return jsonify({"updated": updated})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TEMPLATES
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/templates")
+def get_templates():
+    return jsonify(load_bank().get("templates", []))
+
+
+@app.route("/api/templates", methods=["POST"])
+def create_template():
+    data = request.json
+    bank = load_bank()
+    tmpl = {
+        "id": str(uuid.uuid4()),
+        "name": (data.get("name") or "Untitled Template").strip(),
+        "config": data.get("config", {}),
+        "front_matter": data.get("front_matter", ""),
+        "created": datetime.now().isoformat(),
+    }
+    bank.setdefault("templates", []).append(tmpl)
+    save_bank(bank)
+    log_success(f"Template saved: '{tmpl['name']}'")
+    return jsonify(tmpl), 201
+
+
+@app.route("/api/templates/<tid>", methods=["DELETE"])
+def delete_template(tid):
+    bank = load_bank()
+    bank["templates"] = [t for t in bank.get("templates", []) if t["id"] != tid]
+    save_bank(bank)
+    return jsonify({"status": "deleted"})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CSV EXPORT
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/export-csv")
+def export_csv():
+    import csv, io
+    from flask import Response
+    bank = load_bank()
+    qs = bank["questions"]
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "id", "type", "stem", "correct_answer", "points",
+        "topic", "difficulty", "lecture", "source", "bloom",
+        "flagged", "tags", "objectives", "notes",
+    ])
+    for q in qs:
+        writer.writerow([
+            q.get("id", ""),
+            q.get("type", ""),
+            q.get("stem", ""),
+            q.get("correct_answer", ""),
+            q.get("points", 0),
+            q.get("topic", ""),
+            q.get("difficulty", ""),
+            q.get("lecture", ""),
+            q.get("source", ""),
+            q.get("bloom", ""),
+            "yes" if q.get("flagged") else "no",
+            ", ".join(q.get("tags", [])),
+            ", ".join(q.get("objectives", [])),
+            q.get("notes", ""),
+        ])
+    out.seek(0)
+    return Response(
+        out.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={_active_bank_id}.csv"},
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# QTI EXPORT (IMS QTI 2.1)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _question_to_qti_xml(q: dict, idx: int) -> str:
+    qid = f"item_{q.get('id', str(idx))[:12]}"
+    title_raw = q.get("stem", "")[:60].replace('"', "'")
+    stem_text = (q.get("stem") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    qtype = q.get("type", "short_answer")
+    pts = q.get("points") or 1
+
+    if qtype in ("mc", "multi_select"):
+        cardinality = "multiple" if qtype == "multi_select" else "single"
+        correct_raw = q.get("correct_answer", "") or ""
+        correct_letters = [l.strip() for l in correct_raw.split(",") if l.strip()]
+        resp = f'<responseDeclaration identifier="RESPONSE" cardinality="{cardinality}" baseType="identifier">\n'
+        if correct_letters:
+            resp += '  <correctResponse>\n'
+            for l in correct_letters:
+                resp += f'    <value>choice_{l}</value>\n'
+            resp += '  </correctResponse>\n'
+        resp += '</responseDeclaration>'
+        max_c = 1 if qtype == "mc" else len(q.get("choices") or [])
+        choices_xml = "".join(
+            f'  <simpleChoice identifier="choice_{ch["letter"]}">{ch["text"].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")}</simpleChoice>\n'
+            for ch in (q.get("choices") or [])
+        )
+        interaction = (
+            f'<choiceInteraction responseIdentifier="RESPONSE" shuffle="false" maxChoices="{max_c}">\n'
+            f'  <prompt>{stem_text}</prompt>\n'
+            f'{choices_xml}</choiceInteraction>'
+        )
+    elif qtype == "true_false":
+        correct = (q.get("correct_answer") or "").strip().lower()
+        correct_id = "choice_true" if correct in ("true", "t") else "choice_false"
+        resp = (
+            f'<responseDeclaration identifier="RESPONSE" cardinality="single" baseType="identifier">\n'
+            f'  <correctResponse><value>{correct_id}</value></correctResponse>\n'
+            f'</responseDeclaration>'
+        )
+        interaction = (
+            f'<choiceInteraction responseIdentifier="RESPONSE" shuffle="false" maxChoices="1">\n'
+            f'  <prompt>{stem_text}</prompt>\n'
+            f'  <simpleChoice identifier="choice_true">True</simpleChoice>\n'
+            f'  <simpleChoice identifier="choice_false">False</simpleChoice>\n'
+            f'</choiceInteraction>'
+        )
+    elif qtype == "fill_blank":
+        blanks = q.get("blanks") or []
+        correct_val = (blanks[0] if blanks else q.get("correct_answer", "")).replace("&","&amp;").replace("<","&lt;")
+        resp = (
+            f'<responseDeclaration identifier="RESPONSE" cardinality="single" baseType="string">\n'
+            + (f'  <correctResponse><value>{correct_val}</value></correctResponse>\n' if correct_val else '')
+            + '</responseDeclaration>'
+        )
+        interaction = f'<p>{stem_text}</p>\n<textEntryInteraction responseIdentifier="RESPONSE" expectedLength="50"/>'
+    else:
+        resp = '<responseDeclaration identifier="RESPONSE" cardinality="single" baseType="string"/>'
+        expected = q.get("essay_lines") or 5
+        interaction = (
+            f'<extendedTextInteraction responseIdentifier="RESPONSE" expectedLines="{expected}">\n'
+            f'  <prompt>{stem_text}</prompt>\n'
+            f'</extendedTextInteraction>'
+        )
+
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<assessmentItem xmlns="http://www.imsglobal.org/xsd/imsqti_v2p1"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xsi:schemaLocation="http://www.imsglobal.org/xsd/imsqti_v2p1 http://www.imsglobal.org/xsd/qti/qtiv2p1/imsqti_v2p1.xsd"
+                identifier="{qid}"
+                title="{title_raw.replace("&","&amp;").replace("<","&lt;")}"
+                adaptive="false"
+                timeDependent="false">
+  {resp}
+  <outcomeDeclaration identifier="SCORE" cardinality="single" baseType="float">
+    <defaultValue><value>0</value></defaultValue>
+  </outcomeDeclaration>
+  <itemBody>
+    {interaction}
+  </itemBody>
+</assessmentItem>'''
+
+
+def _qti_manifest(questions: list) -> str:
+    items = "\n".join(
+        f'    <resource identifier="item_{q.get("id","")[:12]}" type="imsqti_item_xmlv2p1" href="item_{q.get("id","")[:12]}.xml"/>'
+        for q in questions
+    )
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<manifest xmlns="http://www.imsglobal.org/xsd/imscp_v1p1"
+          identifier="MANIFEST-QTI-EXPORT">
+  <resources>
+{items}
+  </resources>
+</manifest>'''
+
+
+@app.route("/api/export-qti", methods=["POST"])
+def export_qti():
+    import zipfile, io as _io
+    data = request.json
+    qids = data.get("question_ids", [])
+    bank = load_bank()
+    id_map = {q["id"]: q for q in bank["questions"]}
+    selected = [id_map[qid] for qid in qids if qid in id_map]
+    if not selected:
+        return jsonify({"error": "No valid questions"}), 400
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, q in enumerate(selected, 1):
+            xml = _question_to_qti_xml(q, i)
+            zf.writestr(f"item_{q.get('id','')[:12]}.xml", xml)
+        zf.writestr("imsmanifest.xml", _qti_manifest(selected))
+    buf.seek(0)
+    log_success(f"QTI export: {len(selected)} items")
+    return send_file(buf, as_attachment=True,
+                     download_name=f"{_active_bank_id}_qti.zip",
+                     mimetype="application/zip")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MULTIPLE EXAM VARIANTS
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/generate-pdf-variants", methods=["POST"])
+def generate_pdf_variants():
+    import zipfile, io as _io
+    data = request.json
+    qids = data.get("question_ids", [])
+    config = data.get("config", {})
+    n_variants = min(max(int(data.get("variants", 2)), 2), 8)
+    shuffle_questions = bool(data.get("shuffle_questions", True))
+
+    bank = load_bank()
+    id_map = {q["id"]: q for q in bank["questions"]}
+    selected = [id_map[qid] for qid in qids if qid in id_map]
+    if not selected:
+        return jsonify({"error": "No valid questions selected"}), 400
+
+    letters = list("ABCDEFGH")[:n_variants]
+    base_title = config.get("title", "Exam")
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for letter in letters:
+            vc = {**config}
+            vc["filename"] = f"exam_variant_{letter}.pdf"
+            vc["title"] = f"{base_title} — Variant {letter}"
+            vc["shuffle_choices"] = True
+            qs = list(selected)
+            if shuffle_questions:
+                random.shuffle(qs)
+            fp = generate_exam_pdf(qs, vc)
+            zf.write(str(fp), f"Variant_{letter}.pdf")
+
+        # Combined answer key (no shuffling so letters are stable)
+        kc = {**config}
+        kc["filename"] = "answer_key.pdf"
+        kc["title"] = f"{base_title} — Answer Key"
+        kc["generate_key"] = True
+        kc["shuffle_choices"] = False
+        fp = generate_exam_pdf(selected, kc)
+        zf.write(str(fp), "Answer_Key.pdf")
+
+    buf.seek(0)
+    log_success(f"PDF variants generated: {n_variants} variants of '{base_title}'")
+    return send_file(buf, as_attachment=True,
+                     download_name="exam_variants.zip",
+                     mimetype="application/zip")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DIFFICULTY CALIBRATION
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/calibrate", methods=["POST"])
+def calibrate_questions():
+    """
+    Accepts CSV with columns: question_number, source (optional), pct_correct
+    Updates empirical_difficulty on matching questions.
+    """
+    import csv, io as _io
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    content = request.files["file"].read().decode("utf-8", errors="replace")
+    reader = csv.DictReader(_io.StringIO(content))
+    entries = []
+    for row in reader:
+        try:
+            qnum = int(row.get("question_number") or row.get("q") or 0)
+            raw = str(row.get("pct_correct") or row.get("pct") or row.get("score") or 0)
+            pct = float(raw.strip("%")) / (100 if "%" in raw else 1)
+            src = (row.get("source") or "").strip()
+            if qnum > 0:
+                entries.append({"number": qnum, "source": src, "pct": max(0.0, min(1.0, pct))})
+        except (ValueError, KeyError):
+            continue
+    if not entries:
+        return jsonify({"error": "No valid entries. Expected columns: question_number, pct_correct (optionally source)."}), 400
+
+    bank = load_bank()
+    updated = 0
+    for entry in entries:
+        for q in bank["questions"]:
+            if q.get("number") != entry["number"]:
+                continue
+            if entry["source"] and q.get("source", "").strip().lower() != entry["source"].lower():
+                continue
+            q["empirical_difficulty"] = round(entry["pct"], 3)
+            updated += 1
+            break
+
+    if updated:
+        save_bank(bank)
+    log_info(f"Calibration: {updated} questions updated from {len(entries)} entries")
+    return jsonify({"updated": updated, "entries": len(entries)})
 
 
 if __name__ == "__main__":

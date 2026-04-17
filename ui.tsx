@@ -150,6 +150,16 @@ export function useTheme() {
 // ── Static exports (no color dependency) ─────────────────────────────────────
 export const DIFFS: Difficulty[] = ['easy', 'medium', 'hard'];
 
+import type { BloomLevel } from './types';
+export const BLOOMS: { key: BloomLevel; label: string }[] = [
+  { key: 'remember',   label: 'Remember' },
+  { key: 'understand', label: 'Understand' },
+  { key: 'apply',      label: 'Apply' },
+  { key: 'analyze',    label: 'Analyze' },
+  { key: 'evaluate',   label: 'Evaluate' },
+  { key: 'create',     label: 'Create' },
+];
+
 export const SNIPPET_CATS = [
   'reference', 'register table', 'instruction table',
   'figure', 'formula', 'code example', 'other',

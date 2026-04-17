@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import {
   useTheme, Badge, Btn, Inp, Sel, Chk, Field, Mono, MdPreview,
-  TextArea, CodeTextArea, DIFFS,
+  TextArea, CodeTextArea, DIFFS, BLOOMS,
 } from './ui';
-import type { Question, QuestionType, Difficulty } from './types';
+import type { Question, QuestionType, Difficulty, BloomLevel } from './types';
 
 interface QuestionRowProps {
   q: Question;
@@ -26,6 +26,8 @@ export default function QuestionRow({
   const [showPreview, setShowPreview] = useState(false);
   useEffect(() => setL({ ...q }), [q]);
 
+  const [newObjective, setNewObjective] = useState('');
+
   const handleUpdate = () => {
     onUpdate(q.id, {
       type: L.type, difficulty: L.difficulty, points: L.points,
@@ -33,8 +35,17 @@ export default function QuestionRow({
       stem: L.stem, choices: L.choices, correct_answer: L.correct_answer,
       blanks: L.blanks, essay_lines: L.essay_lines,
       code_block: L.code_block, code_language: L.code_language,
-      tags: L.tags,
+      tags: L.tags, notes: L.notes, flagged: L.flagged,
+      bloom: L.bloom, objectives: L.objectives,
     });
+  };
+
+  const addObjective = () => {
+    const t = newObjective.trim();
+    if (t && !(L.objectives || []).includes(t)) {
+      setL(l => ({ ...l, objectives: [...(l.objectives || []), t] }));
+    }
+    setNewObjective('');
   };
 
   const addTag = () => {
@@ -101,9 +112,19 @@ export default function QuestionRow({
             <Badge color={DIFF_C[q.difficulty]}>{q.difficulty}</Badge>
             {q.points > 0 && <Badge color={C.warn}>{q.points} pts</Badge>}
             {q.lecture && <Badge color={C.textMuted}>Lec {q.lecture}</Badge>}
+            {q.bloom && <Badge color={C.cyan}>⬡ {q.bloom}</Badge>}
+            {(q.empirical_difficulty != null) && (
+              <Badge color={q.empirical_difficulty >= 0.7 ? C.success : q.empirical_difficulty >= 0.4 ? C.warn : C.danger}>
+                {Math.round(q.empirical_difficulty * 100)}% correct
+              </Badge>
+            )}
+            {(q.objectives || []).map(obj => (
+              <Badge key={obj} color={C.pink}>◎ {obj}</Badge>
+            ))}
             {(q.tags || []).map(tag => (
               <Badge key={tag} color={C.textDim}># {tag}</Badge>
             ))}
+            {q.flagged && <Badge color={C.danger}>⚑ Flagged</Badge>}
             {usedOn.length > 0 && (
               <span title={usedOn.join(', ')}>
                 <Badge color={C.success}>Used {usedOn.length}×</Badge>
@@ -112,6 +133,8 @@ export default function QuestionRow({
           </div>
         </div>
         <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+          <Btn sm v={q.flagged ? 'danger' : 'ghost'} onClick={() => onUpdate(q.id, { flagged: !q.flagged })}
+            title={q.flagged ? 'Remove flag' : 'Flag for review'}>⚑</Btn>
           <Btn sm v="ghost" onClick={onEdit}>{isEdit ? 'Close' : 'Edit'}</Btn>
           <Btn sm v="danger" onClick={onDelete}>Del</Btn>
         </div>
@@ -163,6 +186,51 @@ export default function QuestionRow({
               <Inp value={L.source || ''}
                 onChange={e => setL(l => ({ ...l, source: e.target.value }))} />
             </Field>
+            <Field label="Bloom's Level">
+              <Sel value={L.bloom || ''} style={{ width: '100%' }}
+                onChange={e => setL(l => ({ ...l, bloom: e.target.value as BloomLevel | '' }))}>
+                <option value="">— None —</option>
+                {BLOOMS.map(b => <option key={b.key} value={b.key}>{b.label}</option>)}
+              </Sel>
+            </Field>
+            <Field label="Flag for Review" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 2 }}>
+                <Chk checked={!!L.flagged} onChange={() => setL(l => ({ ...l, flagged: !l.flagged }))} />
+                <span style={{ fontSize: 12, color: L.flagged ? C.danger : C.textMuted }}>
+                  {L.flagged ? '⚑ Flagged' : 'Not flagged'}
+                </span>
+              </div>
+            </Field>
+          </div>
+
+          {/* Learning Objectives */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 650, color: C.textMuted, textTransform: 'uppercase', letterSpacing: 0.3, marginBottom: 6 }}>
+              Learning Objectives
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 6 }}>
+              {(L.objectives || []).map(obj => (
+                <span key={obj} style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 4,
+                  padding: '2px 8px', borderRadius: 10, fontSize: 11.5,
+                  background: `${C.pink}18`, border: `1px solid ${C.pink}33`, color: C.pink,
+                }}>
+                  ◎ {obj}
+                  <span onClick={() => setL(l => ({ ...l, objectives: (l.objectives || []).filter(o => o !== obj) }))}
+                    style={{ cursor: 'pointer', color: C.textDim, fontSize: 13, lineHeight: 1 }}>×</span>
+                </span>
+              ))}
+              {(L.objectives || []).length === 0 && (
+                <span style={{ fontSize: 11, color: C.textDim }}>No objectives</span>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Inp value={newObjective} placeholder="e.g. LO3: Explain memory addressing"
+                onChange={e => setNewObjective(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addObjective(); } }}
+                style={{ flex: 1 }} />
+              <Btn sm v="ghost" onClick={addObjective}>Add</Btn>
+            </div>
           </div>
 
           <Field label="Question Stem (Markdown)" style={{ marginBottom: 12 }}>
@@ -283,6 +351,47 @@ export default function QuestionRow({
                 onChange={e => setL(l => ({ ...l, code_block: e.target.value }))} />
             </Field>
           )}
+
+          {/* Private Notes */}
+          <Field label="Private Notes (not printed)" style={{ marginBottom: 12 }}>
+            <TextArea value={L.notes || ''}
+              onChange={e => setL(l => ({ ...l, notes: e.target.value }))}
+              placeholder="e.g. This question was too easy Spring 2025. Update if we cover SIMD."
+              style={{ minHeight: 60 }} />
+          </Field>
+
+          {/* Image upload shortcut for stem */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 650, color: C.textMuted, textTransform: 'uppercase', letterSpacing: 0.3, marginBottom: 6 }}>
+              Insert Image into Stem
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <label style={{
+                padding: '5px 12px', borderRadius: 6, cursor: 'pointer',
+                background: C.accentBg, color: C.accent, border: `1px solid ${C.accent}40`,
+                fontSize: 11.5, fontWeight: 600, whiteSpace: 'nowrap',
+              }}>
+                📎 Upload Image
+                <input type="file" accept=".png,.jpg,.jpeg,.gif,.svg" style={{ display: 'none' }}
+                  onChange={async e => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    const fd = new FormData();
+                    fd.append('file', file);
+                    try {
+                      const r = await fetch('/api/upload-image', { method: 'POST', body: fd });
+                      const d = await r.json() as { error?: string; markdown_ref: string };
+                      if (d.error) throw new Error(d.error);
+                      setL(l => ({ ...l, stem: l.stem + (l.stem ? '\n\n' : '') + d.markdown_ref }));
+                    } catch (err) {
+                      alert((err as Error).message);
+                    }
+                    e.target.value = '';
+                  }} />
+              </label>
+              <span style={{ fontSize: 11, color: C.textDim }}>Reference inserts as ![alt](filename) in the stem</span>
+            </div>
+          </div>
 
           {/* Tags */}
           <div style={{ marginBottom: 12 }}>

@@ -1,94 +1,34 @@
-# CSc 35 Test Bank — Feature Suggestions
+# TestBanksy — Feature Suggestions
 
 ---
 
-## 1. Exam Management
+## Already Implemented
 
-**Exam Archive**
-Save generated exams (question list, config, PDF) as named records. Currently there's no way to recall what was on a previous exam without re-importing the .docx. An archive would let you open "Fall 2025 Midterm 1" and see exactly which questions were used, in what order, with what point values.
+The following were previously listed as suggestions and have since shipped:
 
-**Question Usage Tracking**
-Track which exams each question has appeared on. Show a "Used on: Fall 2025 Midterm 1, Spring 2026 Final" badge on question rows. Add a "Not used since" filter so you can avoid recycling recent questions or deliberately pick ones students haven't seen.
-
-**Multiple Exam Variants**
-Extend the existing shuffle feature to generate N variants of the same exam in one click (e.g. Variant A/B/C/D), each with independently shuffled MC choices and question order. Produce one PDF per variant plus a combined answer key keyed to variant letter.
-
-**Exam Templates**
-Save a PDF config (title, instructions, point layout, front matter snippet) as a named template. Apply a template when starting a new exam instead of re-entering the same fields each time.
-
----
-
-## 2. Question Authoring
-
-**Bulk Field Edit**
-Select multiple questions and set a shared field — topic, difficulty, lecture number, or point value — across all of them at once. Useful after a bulk import where every question lands with blank metadata.
-
-**Question Preview (PDF-accurate)**
-Render a single question exactly as it will appear in the PDF, inline in the browser, before adding it to an exam. The current markdown preview is approximate; a true PDF-accurate preview would catch formatting issues early.
-
-**Internal Notes Field**
-A private notes field on each question (not printed on the exam) for things like "this question was too easy Spring 2025" or "update this if we cover SIMD in lecture 9."
-
-**Question Flag / Review Queue**
-A one-click "flag for review" toggle. Add a filter for flagged questions so you can batch-review them before an exam. Useful after grading when you want to mark questions that performed poorly.
-
-**Image Support in Question Stems**
-Extend the existing image-upload infrastructure (currently front matter only) to individual question stems. Important for architecture diagrams, memory maps, register state snapshots, and circuit questions.
-
----
-
-## 3. Organization & Search
-
-**Bloom's Taxonomy Tag**
-Add a Bloom's level field (Remember / Understand / Apply / Analyze / Evaluate / Create) alongside difficulty. Lets you verify an exam has the right cognitive mix, not just the right easy/medium/hard ratio.
-
-**Learning Objective Mapping**
-Tag each question to one or more course learning objectives. Show per-objective coverage in the stats panel and warn when a generated exam is missing an objective entirely.
-
-**Saved Filters / Smart Collections**
-Save a filter combination as a named collection — e.g. "Hard x86 questions not used this semester." Collections update dynamically as the bank changes.
-
-**Full-Text Search Improvements**
-Add regex search and search within code blocks. Currently the search only matches stem text, topic, and code block content but doesn't support pattern matching or field-scoped queries like `topic:addressing difficulty:hard`.
-
----
-
-## 4. Import / Export
-
-**Import Review Step**
-After parsing a .docx, show a staging area where you can review, correct, and selectively approve each parsed question before it hits the bank. Currently all parsed questions are committed immediately, and bad parses require manual cleanup after the fact.
-
-**CSV / Excel Export**
-Export the question bank (or a filtered subset) to a spreadsheet for offline review, printing, or sharing with a colleague who doesn't run the app.
-
-**QTI Export**
-Export selected questions in IMS QTI format for import into Canvas, Blackboard, or other LMS platforms. Would allow using the bank as the source of truth for online quizzes too.
-
-**Batch Answer Key Application**
-Extend the existing answer key upload to match by stem similarity rather than only by source + question number. Useful when a key file was generated from a different version of the exam document.
-
----
-
-## 5. Analytics
-
-**Per-Question Difficulty Calibration**
-After grading, import a CSV of per-question scores (question number → % correct). Store the empirical difficulty alongside the manual tag. Surface questions where the manual and empirical difficulty disagree significantly.
-
-**Exam Balance Report**
-Before downloading a PDF, show a breakdown of the selected questions: topic coverage, difficulty distribution, Bloom's levels, total points, and estimated time (based on type and point value). Flag imbalances — e.g. 70% of points on one topic.
-
-**Bank Health Dashboard**
-Expand the current stats panel with trends over time: questions added per semester, coverage gaps by lecture, stale questions (not used in N semesters), and questions with missing metadata.
-
----
-
-## 6. Workflow & Reliability
-
-**Auto-Backup**
-Write a timestamped backup of `question_bank.json` to a `backups/` folder on every save (capped at the last N backups). A corrupted bank is currently unrecoverable without a manual backup.
-
-**Undo / Change History**
-Keep a short in-memory undo stack for destructive operations — question deletion, bulk delete from duplicate scan, bulk field edits. A single "Undo last action" button would cover the most painful accidental deletions.
-
-**Keyboard Shortcuts**
-Add shortcuts for common actions: open composer (`N`), confirm/save (`Ctrl+Enter`), cancel (`Escape`), toggle selection (`Space`). Useful when building exams from a large bank where mouse-heavy workflows slow things down.
+- **Exam Archive** — generated exams are saved with title, question list, and config; loadable from the Generate view
+- **Question Usage Tracking** — each question row shows which archived exams it has appeared on
+- **Import Review Step** — parsed questions are staged for selective approval before committing to the bank
+- **Answer Key Upload** — standalone answer key files (`.docx` or `.md`) can be applied to existing questions
+- **Duplicate Detection** — similarity scan with bulk-delete and age-based auto-selection
+- **Multiple Banks** — create and switch between isolated banks from the header
+- **Auto-Backup** — timestamped backups written to `backups/` on every save
+- **Fuzzy Answer Key Matching** — "Fuzzy stem matching" toggle on the Answer Key upload tab; upload a full exam document and answers are applied to whichever bank question has the most similar stem, regardless of question number
+- **Multiple Exam Variants** — generate N independently shuffled variants (A/B/C/D…) plus a combined answer key, all packaged as a zip
+- **Exam Templates** — save a PDF config (title, instructions, point layout, front matter) as a named template and apply it when building a new exam
+- **Bulk Field Edit** — select 2+ questions and set a shared field (topic, difficulty, lecture, points) across all of them at once
+- **Question Preview (PDF-accurate)** — "Preview PDF" button generates and opens the real PDF in a new tab before downloading
+- **Internal Notes Field** — private per-question notes field (not printed on the exam) for instructor commentary
+- **Question Flag / Review Queue** — one-click ⚑ flag toggle on each question; filterable in the bank view
+- **Image Support in Question Stems** — image upload button in the question editor inserts a markdown image reference into the stem
+- **Bloom's Taxonomy Tag** — Bloom's level field (Remember → Create) on each question; filterable in the bank and shown in the Stats view
+- **Learning Objective Mapping** — tag each question to one or more course learning objectives; shown as badges on each row
+- **Saved Filters / Smart Collections** — save a filter combination as a named collection; collections update dynamically as the bank changes
+- **Full-Text Search Improvements** — regex search (`/pattern/flags` syntax) and field-scoped filters for type, difficulty, bloom, and flagged status
+- **CSV Export** — export the full bank to a spreadsheet via the Export CSV button in the bank toolbar
+- **QTI Export** — export selected questions as an IMS QTI 2.1 zip (Canvas / Blackboard compatible) via Export QTI in the bank toolbar
+- **Per-Question Difficulty Calibration** — import a post-grading CSV (question number → % correct); empirical difficulty stored and surfaced as a badge; mismatches highlighted in Stats view
+- **Exam Balance Report** — before downloading, toggle a breakdown panel showing topic coverage, difficulty distribution, Bloom's levels, total points, and imbalance warnings
+- **Bank Health Dashboard** — Stats view with summary cards, type/difficulty/bloom bar charts, source breakdown, topics grid, and empirical-vs-manual difficulty mismatch table
+- **Undo / Change History** — in-memory undo stack covering question deletion and bulk delete; Ctrl+Z or the Undo button restores the last destructive action
+- **Keyboard Shortcuts** — `N` opens the composer, `A` selects all visible questions, `Escape` cancels selection, `Ctrl+Z` undoes the last deletion

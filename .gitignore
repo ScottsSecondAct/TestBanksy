@@ -22,6 +22,14 @@ node_modules/
 dist/
 *.local
 
+# Playwright output
+playwright-report/
+test-results/
+.playwright/
+
+# Python test cache
+.pytest_cache/
+
 # Logs
 *.log
 

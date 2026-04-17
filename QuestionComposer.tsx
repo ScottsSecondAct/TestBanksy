@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import {
   useTheme, Badge, Btn, Inp, Sel, Chk, Field, MdPreview,
-  TextArea, CodeTextArea, DIFFS,
+  TextArea, CodeTextArea, DIFFS, BLOOMS,
 } from './ui';
 import { apiFetch } from './api';
-import type { DraftQuestion, QuestionType, DuplicateMatch } from './types';
+import type { DraftQuestion, QuestionType, DuplicateMatch, BloomLevel } from './types';
 
 const BLANK_Q: DraftQuestion = {
   type: 'mc',
@@ -27,6 +27,11 @@ const BLANK_Q: DraftQuestion = {
   source: '',
   semester: '',
   tags: [],
+  notes: '',
+  flagged: false,
+  bloom: '',
+  objectives: [],
+  empirical_difficulty: null,
 };
 
 interface QuestionComposerProps {
@@ -206,6 +211,13 @@ export default function QuestionComposer({
               <datalist id="sources-list">
                 {existingSources.map(s => <option key={s} value={s} />)}
               </datalist>
+            </Field>
+            <Field label="Bloom's Level">
+              <Sel value={q.bloom || ''} style={{ width: '100%' }}
+                onChange={e => setField('bloom', e.target.value as BloomLevel | '')}>
+                <option value="">— None —</option>
+                {BLOOMS.map(b => <option key={b.key} value={b.key}>{b.label}</option>)}
+              </Sel>
             </Field>
           </div>
 
