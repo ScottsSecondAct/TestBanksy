@@ -140,6 +140,51 @@ class TestBulkUpdate:
         assert r.status_code == 400
 
 
+# ── /api/questions/bulk-delete ────────────────────────────────────────────────
+
+class TestBulkDelete:
+    def _add(self, client, sample_question, **overrides):
+        q = {**sample_question, **overrides, "force": True}
+        return client.post("/api/questions",
+                           data=json.dumps(q),
+                           content_type="application/json").get_json()["id"]
+
+    def test_bulk_delete_multiple(self, client, sample_question):
+        id1 = self._add(client, sample_question, stem="Delete me alpha")
+        id2 = self._add(client, sample_question, stem="Delete me beta")
+        r = client.post("/api/questions/bulk-delete",
+                        data=json.dumps({"ids": [id1, id2]}),
+                        content_type="application/json")
+        assert r.status_code == 200
+        assert r.get_json()["deleted"] == 2
+        assert client.get("/api/questions").get_json() == []
+
+    def test_bulk_delete_partial(self, client, sample_question):
+        id1 = self._add(client, sample_question, stem="Keep me here")
+        id2 = self._add(client, sample_question, stem="Remove me here")
+        client.post("/api/questions/bulk-delete",
+                    data=json.dumps({"ids": [id2]}),
+                    content_type="application/json")
+        remaining = client.get("/api/questions").get_json()
+        assert len(remaining) == 1
+        assert remaining[0]["id"] == id1
+
+    def test_bulk_delete_atomic(self, client, sample_question):
+        """All IDs deleted in a single load/save cycle — no race condition."""
+        ids = [self._add(client, sample_question, stem=f"Atomic stem {i}") for i in range(5)]
+        r = client.post("/api/questions/bulk-delete",
+                        data=json.dumps({"ids": ids}),
+                        content_type="application/json")
+        assert r.get_json()["deleted"] == 5
+        assert client.get("/api/questions").get_json() == []
+
+    def test_bulk_delete_missing_ids_400(self, client):
+        r = client.post("/api/questions/bulk-delete",
+                        data=json.dumps({}),
+                        content_type="application/json")
+        assert r.status_code == 400
+
+
 # ── /api/stats ────────────────────────────────────────────────────────────────
 
 class TestStats:

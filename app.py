@@ -1794,6 +1794,21 @@ def upload_image():
 # BULK UPDATE
 # ════════════════════════════════════════════════════════════════════════════
 
+@app.route("/api/questions/bulk-delete", methods=["POST"])
+def bulk_delete_questions():
+    data = request.json
+    ids = set(data.get("ids", []))
+    if not ids:
+        return jsonify({"error": "ids required"}), 400
+    bank = load_bank()
+    before = len(bank["questions"])
+    bank["questions"] = [q for q in bank["questions"] if q["id"] not in ids]
+    deleted = before - len(bank["questions"])
+    save_bank(bank)
+    log_info(f"Bulk deleted {deleted} questions")
+    return jsonify({"deleted": deleted})
+
+
 @app.route("/api/questions/bulk-update", methods=["POST"])
 def bulk_update_questions():
     data = request.json

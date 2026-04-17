@@ -474,11 +474,19 @@ export default function App() {
     const ids = [...dupDeleteSet];
     if (ids.length === 0) return;
     const removed = questions.filter(q => dupDeleteSet.has(q.id));
-    await Promise.all(ids.map(id => apiFetch(`/questions/${id}`, { method: 'DELETE' })));
+    try {
+      await apiFetch('/questions/bulk-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+    } catch (e) {
+      showToast((e as Error).message, 'error');
+      return;
+    }
     setQuestions(qs => qs.filter(q => !dupDeleteSet.has(q.id)));
     setSelected(s => { const n = new Set(s); ids.forEach(id => n.delete(id)); return n; });
     const remaining = dupScan?.filter(p => !dupDeleteSet.has(p.a.id) && !dupDeleteSet.has(p.b.id)) ?? [];
-    setDupScan(remaining);
+    setDupScan(remaining.length > 0 ? remaining : null);
     setDupDeleteSet(new Set());
     if (removed.length > 0)
       setUndoStack(s => [...s.slice(-9), { action: 'bulk_delete', questions: removed, label: `${removed.length} duplicates` }]);
