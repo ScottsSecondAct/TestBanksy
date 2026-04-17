@@ -2,6 +2,8 @@
 exports/
 TestBank/
 uploads/
+ExampleQuestions/
+backups/
 
 # Python
 __pycache__/

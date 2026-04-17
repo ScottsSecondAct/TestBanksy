@@ -3,7 +3,8 @@ import {
   useTheme, Badge, Btn, Inp, Sel, Chk, Field, MdPreview,
   TextArea, CodeTextArea, DIFFS,
 } from './ui';
-import type { DraftQuestion, QuestionType } from './types';
+import { apiFetch } from './api';
+import type { DraftQuestion, QuestionType, DuplicateMatch } from './types';
 
 const BLANK_Q: DraftQuestion = {
   type: 'mc',
@@ -29,7 +30,7 @@ const BLANK_Q: DraftQuestion = {
 };
 
 interface QuestionComposerProps {
-  onCreate: (q: DraftQuestion) => void;
+  onCreate: (q: DraftQuestion, force?: boolean) => void;
   onCancel: () => void;
   existingTopics: string[];
   existingSources: string[];
@@ -41,6 +42,8 @@ export default function QuestionComposer({
   const { C, TYPES, TYPE_MAP, DIFF_C } = useTheme();
   const [q, setQ] = useState<DraftQuestion>({ ...BLANK_Q });
   const [preview, setPreview] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [dupMatches, setDupMatches] = useState<DuplicateMatch[] | null>(null);
 
   const setField = <K extends keyof DraftQuestion>(field: K, value: DraftQuestion[K]) =>
     setQ(prev => ({ ...prev, [field]: value }));
@@ -87,8 +90,24 @@ export default function QuestionComposer({
     setField('correct_answer', next.join(','));
   };
 
-  const handleCreate = () => {
+  const handleCreate = async (force = false) => {
     if (!q.stem.trim() && !q.code_block.trim()) return;
+    if (force) { onCreate(q, true); return; }
+    if (q.stem.trim().length >= 10) {
+      setChecking(true);
+      try {
+        const res = await apiFetch<{ matches: DuplicateMatch[] }>('/check-duplicate', {
+          method: 'POST',
+          body: JSON.stringify({ stem: q.stem }),
+        });
+        if (res.matches.length > 0) {
+          setDupMatches(res.matches);
+          setChecking(false);
+          return;
+        }
+      } catch { /* proceed if check fails */ }
+      setChecking(false);
+    }
     onCreate(q);
   };
 
@@ -311,15 +330,46 @@ export default function QuestionComposer({
         </>
       )}
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-        <Btn v="primary" onClick={handleCreate}
-          disabled={!q.stem.trim() && !q.code_block.trim()}>
-          Create Question
-        </Btn>
-        <Btn v="ghost" onClick={onCancel}>Cancel</Btn>
-        <div style={{ flex: 1 }} />
-        <Btn sm v="ghost" onClick={() => setQ({ ...BLANK_Q })}>Reset</Btn>
-      </div>
+      {dupMatches && dupMatches.length > 0 && (
+        <div style={{
+          margin: '12px 0', padding: 14, borderRadius: 8,
+          background: `${C.warn}18`,
+          border: `1px solid ${C.warn}66`,
+        }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: C.text }}>
+            Similar question{dupMatches.length > 1 ? 's' : ''} already in the bank:
+          </div>
+          {dupMatches.map(({ score, question: m }) => (
+            <div key={m.id} style={{
+              padding: '8px 10px', marginBottom: 6, borderRadius: 6,
+              background: C.surface, border: `1px solid ${C.border}`, fontSize: 12,
+            }}>
+              <span style={{
+                display: 'inline-block', marginRight: 8, padding: '1px 6px',
+                borderRadius: 4, background: `${C.warn}33`,
+                fontWeight: 700, fontSize: 11, color: C.text,
+              }}>{Math.round(score * 100)}% match</span>
+              <span style={{ color: C.textMuted }}>{m.stem.slice(0, 120)}{m.stem.length > 120 ? '…' : ''}</span>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+            <Btn v="primary" onClick={() => void handleCreate(true)}>Save Anyway</Btn>
+            <Btn v="ghost" onClick={() => setDupMatches(null)}>Back to Edit</Btn>
+          </div>
+        </div>
+      )}
+
+      {!dupMatches && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+          <Btn v="primary" onClick={() => void handleCreate()}
+            disabled={(!q.stem.trim() && !q.code_block.trim()) || checking}>
+            {checking ? 'Checking…' : 'Create Question'}
+          </Btn>
+          <Btn v="ghost" onClick={onCancel}>Cancel</Btn>
+          <div style={{ flex: 1 }} />
+          <Btn sm v="ghost" onClick={() => setQ({ ...BLANK_Q })}>Reset</Btn>
+        </div>
+      )}
     </div>
   );
 }

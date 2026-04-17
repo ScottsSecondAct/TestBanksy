@@ -14,9 +14,12 @@ import re
 import uuid
 import random
 import copy
+import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file
@@ -37,13 +40,61 @@ from reportlab.lib.colors import HexColor
 app = Flask(__name__)
 CORS(app)
 
-BASE = Path(__file__).parent
-BANK_FILE = BASE / "TestBank" / "question_bank.json"
-UPLOAD_DIR = BASE / "uploads"
-EXPORT_DIR = BASE / "exports"
-LOG_FILE   = BASE / "testbank.log"
+BASE          = Path(__file__).parent
+TESTBANK_DIR  = BASE / "TestBank"
+BANKS_FILE    = TESTBANK_DIR / "banks.json"
+UPLOAD_DIR    = BASE / "uploads"
+EXPORT_DIR    = BASE / "exports"
+BACKUP_DIR    = BASE / "backups"
+LOG_FILE      = BASE / "testbank.log"
+TESTBANK_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 EXPORT_DIR.mkdir(exist_ok=True)
+BACKUP_DIR.mkdir(exist_ok=True)
+
+MAX_BACKUPS = 10
+_last_backup_times: dict = {}   # bank_id → float
+
+
+# ── Banks registry ───────────────────────────────────────────────────────────
+
+def load_banks() -> dict:
+    """Load banks registry, always ensuring at least one default bank exists."""
+    if BANKS_FILE.exists():
+        try:
+            state = json.loads(BANKS_FILE.read_text())
+            # Ensure active bank is always in the list
+            if not any(b["id"] == state.get("active") for b in state.get("banks", [])):
+                state.setdefault("banks", []).append({
+                    "id": state.get("active", "question_bank"),
+                    "name": "Question Bank",
+                    "created": datetime.now().isoformat(),
+                })
+            return state
+        except Exception:
+            pass
+    # Bootstrap: always create a default entry
+    default = {"id": "question_bank", "name": "Question Bank", "created": datetime.now().isoformat()}
+    state = {"banks": [default], "active": "question_bank"}
+    save_banks(state)
+    return state
+
+
+def save_banks(state: dict) -> None:
+    tmp = BANKS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(BANKS_FILE)
+
+
+def _init_active_bank() -> str:
+    return load_banks().get("active", "question_bank")
+
+
+_active_bank_id: str = _init_active_bank()
+
+
+def get_bank_file(bank_id: str | None = None) -> Path:
+    return TESTBANK_DIR / f"{bank_id or _active_bank_id}.json"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -72,21 +123,39 @@ def log_warn(msg: str)    -> None: log("WARN",    msg)
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_bank():
-    if BANK_FILE.exists():
-        with open(BANK_FILE) as f:
+    bf = get_bank_file()
+    if bf.exists():
+        with open(bf) as f:
             bank = json.load(f)
-        # Ensure snippets list exists (v2.1 migration)
         if "snippets" not in bank:
             bank["snippets"] = []
+        if "exams" not in bank:
+            bank["exams"] = []
         return bank
-    return {"questions": [], "snippets": [], "metadata": {"created": datetime.now().isoformat(), "version": 2}}
+    return {"questions": [], "snippets": [], "exams": [], "metadata": {"created": datetime.now().isoformat(), "version": 2}}
 
 
 def save_bank(bank):
+    bid = _active_bank_id
+    bf  = get_bank_file(bid)
+    try:
+        if bf.exists():
+            now = time.time()
+            if now - _last_backup_times.get(bid, 0) >= 30:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                shutil.copy2(str(bf), str(BACKUP_DIR / f"{bid}_{ts}.json"))
+                _last_backup_times[bid] = now
+                old = sorted(BACKUP_DIR.glob(f"{bid}_*.json"))
+                for old_file in old[:-MAX_BACKUPS]:
+                    old_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     bank["metadata"]["last_modified"] = datetime.now().isoformat()
     bank["metadata"]["version"] = 2
-    with open(BANK_FILE, "w") as f:
-        json.dump(bank, f, indent=2)
+    tmp = bf.with_suffix(".tmp")
+    tmp.write_text(json.dumps(bank, indent=2))
+    tmp.replace(bf)
 
 
 def new_question(**kwargs):
@@ -113,6 +182,45 @@ def new_question(**kwargs):
     }
     base.update(kwargs)
     return base
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DUPLICATE DETECTION
+# ════════════════════════════════════════════════════════════════════════════
+
+def _normalize_stem(stem: str) -> str:
+    return re.sub(r'\s+', ' ', stem.strip().lower())
+
+
+def stem_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalize_stem(a), _normalize_stem(b)).ratio()
+
+
+def find_duplicates_for(stem: str, questions: list, threshold: float = 0.85) -> list:
+    """Return questions similar to stem above threshold, sorted by score descending."""
+    results = []
+    for q in questions:
+        score = stem_similarity(stem, q.get("stem", ""))
+        if score >= threshold:
+            results.append({"score": round(score, 3), "question": q})
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+def find_all_duplicates(questions: list, threshold: float = 0.85) -> list:
+    """Return all pairs of questions with similarity >= threshold."""
+    pairs = []
+    for i in range(len(questions)):
+        for j in range(i + 1, len(questions)):
+            score = stem_similarity(questions[i].get("stem", ""), questions[j].get("stem", ""))
+            if score >= threshold:
+                pairs.append({
+                    "score": round(score, 3),
+                    "a": questions[i],
+                    "b": questions[j],
+                })
+    pairs.sort(key=lambda x: x["score"], reverse=True)
+    return pairs
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -153,14 +261,17 @@ TF_RE = [
 ANSWER_RE = re.compile(r'^\s*\*?\s*(?:Answer|Correct|Key|Ans)[:\s]+(.+)', re.IGNORECASE)
 BLANK_RE = re.compile(r'_{3,}|(?:\\_){3,}|\{\{blank\}\}')
 
-# Answer key section detection
+# Answer key section detection — permissive: any line whose only content is
+# some form of "answer(s)" / "answer key" / "answer sheet", with optional
+# markdown heading markers, bold markers, and trailing punctuation.
 ANSWER_KEY_HDR_RE = re.compile(
-    r'^\s*#*\s*\*{0,2}\s*(?:answer\s+key|answer\s+sheet|answers|answer)\s*\*{0,2}\s*:?\s*$',
+    r'^\s*#{0,4}\s*\*{0,2}\s*(?:answer\s+key|answer\s+sheet|answers?)\s*\*{0,2}\s*[:\-]?\s*$',
     re.IGNORECASE,
 )
 # Entry like "1. A", "1) B", "2. True", "3: C) some text", "31. A,B,C"
+# Letters extended to A-Z to handle exams with more than 4 choices.
 ANSWER_KEY_ENTRY_RE = re.compile(
-    r'^\s*(\d+)[.):\s]\s*([A-Da-d](?:[,\s]+[A-Da-d])*|True|False|T|F)(?:[).\s]|$)',
+    r'^\s*(\d+)[.):\s]\s*([A-Za-z](?:[,\s]+[A-Za-z])*|True|False|T|F)(?:[).\s]|$)',
     re.IGNORECASE,
 )
 
@@ -171,10 +282,33 @@ MULTI_SELECT_INSTR_RE = re.compile(
 )
 
 
+_TF_NORM = {'t': 'True', 'f': 'False', 'true': 'True', 'false': 'False'}
+
+def _normalize_key_answer(raw):
+    """Normalize a raw answer cell from any answer key format."""
+    # Strip bold markers and parenthetical alternates like "(or 'two')"
+    s = re.sub(r'\*+', '', raw).strip()
+    s = re.sub(r'\s*\(.*', '', s).strip()
+    # T/F
+    if s.lower() in _TF_NORM:
+        return _TF_NORM[s.lower()]
+    # MC with explanation: "B) 74" → "B"
+    mc = re.match(r'^([A-Za-z])\)\s*\S', s)
+    if mc:
+        return mc.group(1).upper()
+    # Single letter or comma/space-separated letters: "A", "A, B, D", "A,B,D"
+    if re.match(r'^[A-Za-z](?:[,\s]+[A-Za-z])*$', s):
+        letters = re.findall(r'[A-Za-z]', s)
+        return ','.join(sorted(set(l.upper() for l in letters)))
+    # Free text (fill-in-blank)
+    return s
+
+
 def extract_answer_key(lines):
     """Scan for an answer key section. Returns (dict[int, str], key_start_idx).
     key_start_idx is the line index of the header, or -1 if none found.
     The dict maps question number → normalized answer ('A'..'D', 'True', 'False').
+    Handles both plain format ("1. A") and markdown table format ("| 1 | **T** | ... |").
     """
     key = {}
     key_start = -1
@@ -186,20 +320,21 @@ def extract_answer_key(lines):
                 e = entry.strip()
                 if not e:
                     continue
+
+                # Markdown table row: | 1 | **T** | explanation |
+                if e.startswith('|'):
+                    parts = [p.strip() for p in e.split('|')]
+                    # parts[0] == '', parts[1] == qnum, parts[2] == answer
+                    if len(parts) >= 3:
+                        qnum_raw = parts[1].strip('*').strip()
+                        if qnum_raw.isdigit():
+                            key[int(qnum_raw)] = _normalize_key_answer(parts[2])
+                    continue
+
+                # Plain format: "1. A", "1) B", "2. True"
                 m = ANSWER_KEY_ENTRY_RE.match(e)
                 if m:
-                    qnum = int(m.group(1))
-                    ans = m.group(2).strip()
-                    norm = {'t': 'True', 'f': 'False',
-                            'true': 'True', 'false': 'False'}
-                    normalized = norm.get(ans.lower())
-                    if normalized:
-                        key[qnum] = normalized
-                    else:
-                        # Multi-letter: "A,B,C" or "A B C" or "ABD" → "A,B,C"
-                        letters = re.findall(r'[A-Da-d]', ans)
-                        key[qnum] = ','.join(sorted(set(l.upper() for l in letters))) if letters else ans.upper()
-                # Keep iterating — allow blank lines between entries
+                    key[int(m.group(1))] = _normalize_key_answer(m.group(2))
             break
 
     return key, key_start
@@ -207,7 +342,7 @@ PTS_RE = re.compile(r'[\(\[]\s*(\d+)\s*(?:pts?|points?)\s*[\)\]]', re.IGNORECASE
 
 # Lines that are exam scaffolding, not question content — flush current question and skip
 SECTION_HDR_RE = re.compile(r'^#{1,4}\s+.+')                    # ## Section Title
-SEPARATOR_RE   = re.compile(r'^[_\-=*]{8,}\s*$')               # _______ or ------- dividers
+SEPARATOR_RE   = re.compile(r'^[_\-=*]{3,}\s*$')               # ---, ___, ***, ======= dividers
 EXAM_NOISE_RE  = re.compile(
     r'^(?:circle|write|select|choose|indicate|fill\s+in|answer\s+all|'
     r'show\s+all\s+work|please\s+write|name\s*:|student\s+name|date\s*:|'
@@ -465,7 +600,9 @@ def parse_markdown_exam(md_text, source_name=""):
             flush()
             section_type = "multi_select"
             continue
-        if SEPARATOR_RE.match(stripped) or EXAM_NOISE_RE.match(stripped):
+        if SEPARATOR_RE.match(stripped):
+            continue  # omit separator lines; don't end the current question
+        if EXAM_NOISE_RE.match(stripped):
             flush()
             continue
 
@@ -600,15 +737,32 @@ def _group_looks_like_code(lines):
     return True
 
 
-def stem_to_paragraphs(stem, style, code_style_width=468):
+def stem_to_paragraphs(stem, style, code_style_width=468, prefix=""):
     """Convert markdown stem to reportlab flowables.
 
     Fenced code blocks (```...```) → CodeBlock.
     Groups of lines that look like code (indented, non-list) → CodeBlock.
     Bullet-list indented lines → Paragraphs with leftIndent.
     Everything else → Paragraph per logical paragraph.
+
+    prefix: if provided, prepended to the first Paragraph with a hanging indent
+    so wrapped lines align under the text rather than the number.
     """
     elements = []
+    _pending_prefix = [prefix]  # consumed on the first Paragraph produced
+
+    def _make_para(text, s):
+        if _pending_prefix[0]:
+            p = _pending_prefix[0]
+            _pending_prefix[0] = ""
+            indent = getattr(s, 'leftIndent', 20) or 20
+            hung = ParagraphStyle(
+                f"_Hang_{id(s)}", parent=s,
+                firstLineIndent=-indent,
+            )
+            return Paragraph(p + text, hung)
+        return Paragraph(text, s)
+
     blocks = re.split(r'(```[\s\S]*?```)', stem)
 
     for block in blocks:
@@ -628,7 +782,6 @@ def stem_to_paragraphs(stem, style, code_style_width=468):
                 elements.append(CodeBlock(code_text, width=code_style_width))
                 elements.append(Spacer(1, 4))
         else:
-            # Split into groups of consecutive non-blank lines
             raw_lines = block.split("\n")
             group: list[str] = []
 
@@ -646,7 +799,7 @@ def stem_to_paragraphs(stem, style, code_style_width=468):
                         indent_pts = (leading // 4) * 14
                         formatted = _inline_format(esc(expanded.lstrip()))
                         s = _indented_style(style, indent_pts) if indent_pts else style
-                        elements.append(Paragraph(formatted, s))
+                        elements.append(_make_para(formatted, s))
 
             for line in raw_lines:
                 if line.strip():
@@ -984,13 +1137,14 @@ def generate_exam_pdf(questions, config):
         if type_label:
             type_label = f' <font size="9" color="#666666">{type_label}</font>'
 
-        # Question number line
-        stem_first_line = q["stem"].split("\n")[0] if q["stem"] else ""
-        # We'll render the number, then the full stem via stem_to_paragraphs
-        elems.append(Paragraph(f"<b>{i}.</b>{pts}{type_label}", s_qnum))
-
-        # Stem
-        stem_elems = stem_to_paragraphs(q["stem"], s_stem, code_style_width=int(content_width - 20))
+        # Question number + stem on the same line; wrapped lines indent under text
+        num_prefix = f"<b>{i}.</b>{pts}{type_label} "
+        elems.append(Spacer(1, 14))  # spacing that was on s_qnum spaceBefore
+        stem_elems = stem_to_paragraphs(
+            q["stem"], s_stem,
+            code_style_width=int(content_width - 20),
+            prefix=num_prefix,
+        )
         elems.extend(stem_elems)
 
         # Code block (dedicated field, separate from stem)
@@ -1088,8 +1242,19 @@ def delete_question(qid):
 def add_question():
     """Manually add a new question."""
     data = request.json
+    force = data.pop("force", False)
     q = new_question(**data)
     bank = load_bank()
+
+    if not force and q.get("stem", "").strip():
+        matches = find_duplicates_for(q["stem"], bank["questions"])
+        if matches:
+            return jsonify({
+                "error": "duplicate",
+                "message": "A similar question already exists. Pass force=true to add anyway.",
+                "matches": matches,
+            }), 409
+
     bank["questions"].append(q)
     save_bank(bank)
     log_success(f"Question created manually: type={q['type']}, topic='{q.get('topic', '')}', id={q['id'][:8]}…")
@@ -1102,6 +1267,7 @@ def upload_docx():
         return jsonify({"error": "No file provided"}), 400
     file = request.files["file"]
     source = request.form.get("source", file.filename)
+    dry_run = request.form.get("dry_run", "false").lower() == "true"
 
     if not file.filename.lower().endswith(".docx"):
         return jsonify({"error": "Only .docx files supported"}), 400
@@ -1115,7 +1281,19 @@ def upload_docx():
         log_error(f"Docx parse failed for '{file.filename}': {e}")
         return jsonify({"error": f"Parse failed: {e}"}), 500
 
+    if dry_run:
+        log_info(f"Docx parsed (dry run): {len(new_qs)} questions from '{source}'")
+        return jsonify({"status": "parsed", "questions": new_qs, "questions_parsed": len(new_qs)})
+
     bank = load_bank()
+
+    duplicate_warnings = []
+    for q in new_qs:
+        if q.get("stem", "").strip():
+            matches = find_duplicates_for(q["stem"], bank["questions"])
+            if matches:
+                duplicate_warnings.append({"imported_stem": q["stem"][:80], "matches": matches})
+
     bank["questions"].extend(new_qs)
     save_bank(bank)
 
@@ -1125,13 +1303,14 @@ def upload_docx():
         type_counts[t] = type_counts.get(t, 0) + 1
 
     summary = ", ".join(f"{v} {k}" for k, v in type_counts.items())
-    log_success(f"Imported {len(new_qs)} questions from docx '{source}' ({summary})")
+    log_success(f"Imported {len(new_qs)} questions from docx '{source}' ({summary}){f', {len(duplicate_warnings)} duplicate warnings' if duplicate_warnings else ''}")
     return jsonify({
         "status": "success",
         "questions_added": len(new_qs),
         "type_counts": type_counts,
         "total_questions": len(bank["questions"]),
         "questions": new_qs,
+        "duplicate_warnings": duplicate_warnings,
     })
 
 
@@ -1141,6 +1320,7 @@ def upload_markdown():
     data = request.json
     md_text = data.get("markdown", "")
     source = data.get("source", "Manual Import")
+    dry_run = data.get("dry_run", False)
 
     if not md_text.strip():
         log_warn("Markdown import attempted with empty content")
@@ -1152,15 +1332,57 @@ def upload_markdown():
         log_error(f"Markdown parse failed for source '{source}': {e}")
         return jsonify({"error": f"Parse failed: {e}"}), 500
 
+    if dry_run:
+        log_info(f"Markdown parsed (dry run): {len(new_qs)} questions from '{source}'")
+        return jsonify({"status": "parsed", "questions": new_qs, "questions_parsed": len(new_qs)})
+
     bank = load_bank()
+
+    duplicate_warnings = []
+    for q in new_qs:
+        if q.get("stem", "").strip():
+            matches = find_duplicates_for(q["stem"], bank["questions"])
+            if matches:
+                duplicate_warnings.append({"imported_stem": q["stem"][:80], "matches": matches})
+
     bank["questions"].extend(new_qs)
     save_bank(bank)
 
-    log_success(f"Imported {len(new_qs)} questions from markdown source '{source}'")
+    log_success(f"Imported {len(new_qs)} questions from markdown source '{source}'{f', {len(duplicate_warnings)} duplicate warnings' if duplicate_warnings else ''}")
     return jsonify({
         "status": "success",
         "questions_added": len(new_qs),
         "questions": new_qs,
+        "duplicate_warnings": duplicate_warnings,
+    })
+
+
+@app.route("/api/commit-import", methods=["POST"])
+def commit_import():
+    """Commit a staged import — saves pre-parsed questions to the bank."""
+    data = request.json
+    new_qs = data.get("questions", [])
+    if not new_qs:
+        return jsonify({"error": "No questions provided"}), 400
+
+    bank = load_bank()
+
+    duplicate_warnings = []
+    for q in new_qs:
+        if q.get("stem", "").strip():
+            matches = find_duplicates_for(q["stem"], bank["questions"])
+            if matches:
+                duplicate_warnings.append({"imported_stem": q["stem"][:80], "matches": matches})
+
+    bank["questions"].extend(new_qs)
+    save_bank(bank)
+
+    source = new_qs[0].get("source", "unknown") if new_qs else "unknown"
+    log_success(f"Committed import: {len(new_qs)} questions from '{source}'")
+    return jsonify({
+        "status": "success",
+        "questions_added": len(new_qs),
+        "duplicate_warnings": duplicate_warnings,
     })
 
 
@@ -1277,9 +1499,139 @@ def get_stats():
     })
 
 
+@app.route("/api/duplicates")
+def get_duplicates():
+    threshold = float(request.args.get("threshold", 0.85))
+    bank = load_bank()
+    pairs = find_all_duplicates(bank["questions"], threshold)
+    return jsonify({"threshold": threshold, "pairs": pairs, "count": len(pairs)})
+
+
+@app.route("/api/check-duplicate", methods=["POST"])
+def check_duplicate():
+    data = request.json
+    stem = data.get("stem", "").strip()
+    threshold = float(data.get("threshold", 0.85))
+    exclude_id = data.get("exclude_id")  # skip a question's own entry when editing
+
+    if not stem:
+        return jsonify({"error": "stem is required"}), 400
+
+    bank = load_bank()
+    candidates = [q for q in bank["questions"] if q["id"] != exclude_id]
+    matches = find_duplicates_for(stem, candidates, threshold)
+    return jsonify({"matches": matches, "count": len(matches)})
+
+
+@app.route("/api/banks")
+def get_banks_route():
+    state = load_banks()
+    enriched = []
+    for b in state["banks"]:
+        bf = get_bank_file(b["id"])
+        count = 0
+        if bf.exists():
+            try:
+                count = len(json.loads(bf.read_text()).get("questions", []))
+            except Exception:
+                pass
+        enriched.append({**b, "question_count": count})
+    return jsonify({"banks": enriched, "active": state.get("active", _active_bank_id)})
+
+
+@app.route("/api/banks", methods=["POST"])
+def create_bank_route():
+    data = request.json
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+
+    bank_id = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or "bank"
+    state = load_banks()
+    existing = {b["id"] for b in state["banks"]}
+    base_id, n = bank_id, 2
+    while bank_id in existing:
+        bank_id = f"{base_id}_{n}"; n += 1
+
+    new_b = {"id": bank_id, "name": name, "created": datetime.now().isoformat()}
+    state["banks"].append(new_b)
+    save_banks(state)
+
+    empty = {"questions": [], "snippets": [], "exams": [],
+             "metadata": {"created": datetime.now().isoformat(), "version": 2}}
+    with open(get_bank_file(bank_id), "w") as f:
+        json.dump(empty, f, indent=2)
+
+    log_success(f"Bank created: '{name}' ({bank_id})")
+    return jsonify({**new_b, "question_count": 0}), 201
+
+
+@app.route("/api/banks/active", methods=["PUT"])
+def set_active_bank():
+    global _active_bank_id
+    data = request.json
+    bank_id = (data.get("id") or "").strip()
+    if not bank_id:
+        return jsonify({"error": "id is required"}), 400
+    state = load_banks()
+    if not any(b["id"] == bank_id for b in state["banks"]):
+        return jsonify({"error": "Bank not found"}), 404
+    _active_bank_id = bank_id
+    state["active"] = bank_id
+    save_banks(state)
+    log_info(f"Active bank → {bank_id}")
+    return jsonify({"active": bank_id})
+
+
+@app.route("/api/banks/<bank_id>", methods=["DELETE"])
+def delete_bank_route(bank_id):
+    if bank_id == _active_bank_id:
+        return jsonify({"error": "Cannot delete the active bank. Switch to another bank first."}), 400
+    state = load_banks()
+    state["banks"] = [b for b in state["banks"] if b["id"] != bank_id]
+    save_banks(state)
+    bf = get_bank_file(bank_id)
+    if bf.exists():
+        bf.unlink()
+    log_info(f"Bank deleted: {bank_id}")
+    return jsonify({"status": "deleted"})
+
+
+@app.route("/api/exams")
+def get_exams():
+    bank = load_bank()
+    return jsonify(bank.get("exams", []))
+
+
+@app.route("/api/exams", methods=["POST"])
+def save_exam():
+    data = request.json
+    exam = {
+        "id": str(uuid.uuid4()),
+        "title": data.get("title", "Untitled Exam"),
+        "question_ids": data.get("question_ids", []),
+        "config": data.get("config", {}),
+        "created": datetime.now().isoformat(),
+    }
+    bank = load_bank()
+    bank["exams"].append(exam)
+    save_bank(bank)
+    log_success(f"Exam archived: '{exam['title']}' ({len(exam['question_ids'])} questions)")
+    return jsonify(exam), 201
+
+
+@app.route("/api/exams/<eid>", methods=["DELETE"])
+def delete_exam(eid):
+    bank = load_bank()
+    bank["exams"] = [e for e in bank.get("exams", []) if e["id"] != eid]
+    save_bank(bank)
+    return jsonify({"status": "deleted"})
+
+
 @app.route("/api/export-bank")
 def export_bank():
-    return send_file(str(BANK_FILE), as_attachment=True, download_name="question_bank.json")
+    bf = get_bank_file()
+    return send_file(str(bf), as_attachment=True, download_name=f"{_active_bank_id}.json")
 
 
 @app.route("/api/import-bank", methods=["POST"])
@@ -1362,8 +1714,8 @@ def upload_image():
 
 if __name__ == "__main__":
     print("Test Bank Manager v2")
-    print(f"Bank: {BANK_FILE}")
+    print(f"Active bank: {_active_bank_id} → {get_bank_file()}")
     print(f"Uploads: {UPLOAD_DIR}")
     print(f"Exports: {EXPORT_DIR}")
-    log_info(f"Server started — bank: {BANK_FILE}")
+    log_info(f"Server started — active bank: {_active_bank_id}")
     app.run(debug=True, port=5000)

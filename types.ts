@@ -74,8 +74,35 @@ export interface Filters {
   source: string;
   lecture: string;
   type: string;
+  answered: '' | 'yes' | 'no';
 }
 
 export type ToastState = { msg: string; type: 'success' | 'error' } | null;
 
 export type View = 'bank' | 'upload' | 'frontmatter' | 'generate';
+
+export interface BankInfo {
+  id: string;
+  name: string;
+  created: string;
+  question_count: number;
+}
+
+export interface ExamRecord {
+  id: string;
+  title: string;
+  question_ids: string[];
+  config: Partial<PdfConfig>;
+  created: string;
+}
+
+export interface DuplicateMatch {
+  score: number;
+  question: Question;
+}
+
+export interface DuplicatePair {
+  score: number;
+  a: Question;
+  b: Question;
+}

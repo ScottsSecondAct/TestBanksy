@@ -9,7 +9,7 @@ import QuestionComposer from './QuestionComposer';
 import SnippetEditor from './SnippetEditor';
 import type {
   Question, DraftQuestion, Snippet, Stats, PdfConfig,
-  Filters, ToastState, View, QuestionType,
+  Filters, ToastState, View, QuestionType, DuplicatePair, ExamRecord, BankInfo,
 } from './types';
 
 type BooleanPdfKey = 'show_points' | 'shuffle_choices' | 'generate_key' | 'front_matter_own_page';
@@ -28,7 +28,7 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filters, setFilters] = useState<Filters>({
-    search: '', topic: '', difficulty: '', source: '', lecture: '', type: '',
+    search: '', topic: '', difficulty: '', source: '', lecture: '', type: '', answered: '',
   });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [composing, setComposing] = useState(false);
@@ -43,6 +43,63 @@ export default function App() {
   });
   const [frontMatter, setFrontMatter] = useState('');
   const [fmPreview, setFmPreview] = useState(false);
+
+  const [dupScan, setDupScan] = useState<DuplicatePair[] | null>(null);
+  const [dupScanLoading, setDupScanLoading] = useState(false);
+
+  const [exams, setExams] = useState<ExamRecord[]>([]);
+  const [saveToArchive, setSaveToArchive] = useState(true);
+  const [archiveName, setArchiveName] = useState('');
+
+  const [banks, setBanks] = useState<BankInfo[]>([]);
+  const [activeBankId, setActiveBankId] = useState('');
+  const [bankPickerOpen, setBankPickerOpen] = useState(false);
+  const [newBankName, setNewBankName] = useState('');
+
+  type StagedImport = { questions: Question[]; source: string };
+  const [stagedImport, setStagedImport] = useState<StagedImport | null>(null);
+  const [stagedSel, setStagedSel] = useState<Set<number>>(new Set());
+  const [dupDeleteSet, setDupDeleteSet] = useState<Set<string>>(new Set());
+
+  const scanDuplicates = async () => {
+    setDupScanLoading(true);
+    setDupDeleteSet(new Set());
+    try {
+      const res = await apiFetch<{ pairs: DuplicatePair[] }>('/duplicates');
+      setDupScan(res.pairs);
+    } catch {
+      showToast('Scan failed', 'error');
+    }
+    setDupScanLoading(false);
+  };
+
+  const toggleDupDelete = (id: string) =>
+    setDupDeleteSet(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  const selectDupsByAge = (keep: 'newer' | 'older') => {
+    if (!dupScan) return;
+    const toDelete = new Set<string>();
+    dupScan.forEach(({ a, b }) => {
+      const aTime = new Date(a.added ?? 0).getTime();
+      const bTime = new Date(b.added ?? 0).getTime();
+      if (keep === 'newer') toDelete.add(aTime <= bTime ? a.id : b.id);
+      else                  toDelete.add(aTime >= bTime ? a.id : b.id);
+    });
+    setDupDeleteSet(toDelete);
+  };
+
+  const bulkDeleteDups = async () => {
+    const ids = [...dupDeleteSet];
+    if (ids.length === 0) return;
+    await Promise.all(ids.map(id => apiFetch(`/questions/${id}`, { method: 'DELETE' })));
+    setQuestions(qs => qs.filter(q => !dupDeleteSet.has(q.id)));
+    setSelected(s => { const n = new Set(s); ids.forEach(id => n.delete(id)); return n; });
+    const remaining = dupScan?.filter(p => !dupDeleteSet.has(p.a.id) && !dupDeleteSet.has(p.b.id)) ?? [];
+    setDupScan(remaining);
+    setDupDeleteSet(new Set());
+    showToast(`Deleted ${ids.length} question${ids.length > 1 ? 's' : ''}`);
+    void refresh();
+  };
 
   const [pdfConfig, setPdfConfig] = useState<PdfConfig>({
     title: 'CSc 35 - Computer Architecture', course: 'Exam', date: '',
@@ -61,22 +118,56 @@ export default function App() {
   // ── Data fetching ──────────────────────────────────────────────────────────
   const refresh = useCallback(async () => {
     try {
-      const [qs, st, h, sn] = await Promise.all([
+      const [qs, st, h, sn, exs, bks] = await Promise.all([
         apiFetch<Question[]>('/questions'),
         apiFetch<Stats>('/stats'),
         apiFetch<{ status: string }>('/health'),
         apiFetch<Snippet[]>('/snippets'),
+        apiFetch<ExamRecord[]>('/exams'),
+        apiFetch<{ banks: BankInfo[]; active: string }>('/banks'),
       ]);
       setQuestions(qs);
       setStats(st);
       setSnippets(sn);
+      setExams(exs);
+      setBanks(bks.banks);
+      setActiveBankId(bks.active);
       setBackendUp(!!h);
     } catch {
       setBackendUp(false);
     }
   }, []);
 
+  const switchBank = async (id: string) => {
+    await apiFetch('/banks/active', { method: 'PUT', body: JSON.stringify({ id }) });
+    setBankPickerOpen(false);
+    setSelected(new Set());
+    setEditingId(null);
+    setComposing(false);
+    setStagedImport(null);
+    setStagedSel(new Set());
+    setFilters({ search: '', topic: '', difficulty: '', source: '', lecture: '', type: '', answered: '' });
+    void refresh();
+  };
+
+  const createBank = async () => {
+    const name = newBankName.trim();
+    if (!name) return;
+    const b = await apiFetch<BankInfo>('/banks', { method: 'POST', body: JSON.stringify({ name }) });
+    setNewBankName('');
+    await switchBank(b.id);
+  };
+
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!bankPickerOpen) return;
+    const close = (e: MouseEvent) => {
+      if (!(e.target as Element).closest('[data-bank-picker]')) setBankPickerOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [bankPickerOpen]);
 
   // ── Upload ─────────────────────────────────────────────────────────────────
   const [importTab, setImportTab] = useState<'docx' | 'markdown' | 'answerkey'>('docx');
@@ -89,24 +180,18 @@ export default function App() {
     const file = fileRef.current?.files?.[0];
     if (!file) return showToast('Select a .docx file', 'error');
     setLoading(true);
+    const source = uploadSource || file.name;
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('source', uploadSource || file.name);
+    fd.append('source', source);
+    fd.append('dry_run', 'true');
     try {
       const r = await fetch('/api/upload', { method: 'POST', body: fd });
-      const d = await r.json() as {
-        error?: string;
-        questions_added: number;
-        type_counts: Record<string, number>;
-      };
+      const d = await r.json() as { error?: string; questions: Question[]; questions_parsed: number };
       if (d.error) throw new Error(d.error);
-      const parts = Object.entries(d.type_counts || {})
-        .map(([k, v]) => `${v} ${TYPE_MAP[k as QuestionType]?.label || k}`)
-        .join(', ');
-      showToast(`Imported ${d.questions_added} questions: ${parts}`);
-      void refresh();
       if (fileRef.current) fileRef.current.value = '';
-      setUploadSource('');
+      setStagedImport({ questions: d.questions, source });
+      setStagedSel(new Set(d.questions.map((_, i) => i)));
     } catch (e) {
       showToast((e as Error).message, 'error');
     }
@@ -116,15 +201,33 @@ export default function App() {
   const handleMarkdownImport = async () => {
     if (!mdText.trim()) return showToast('Paste some markdown first', 'error');
     setLoading(true);
+    const source = uploadSource || 'Markdown Import';
     try {
-      const d = await apiFetch<{ questions_added: number; questions: Question[] }>(
+      const d = await apiFetch<{ questions: Question[]; questions_parsed: number }>(
         '/upload-markdown',
-        { method: 'POST', body: JSON.stringify({ markdown: mdText, source: uploadSource || 'Markdown Import' }) },
+        { method: 'POST', body: JSON.stringify({ markdown: mdText, source, dry_run: true }) },
       );
-      showToast(`Imported ${d.questions_added} question${d.questions_added !== 1 ? 's' : ''}`);
-      void refresh();
+      setStagedImport({ questions: d.questions, source });
+      setStagedSel(new Set(d.questions.map((_, i) => i)));
+    } catch (e) {
+      showToast((e as Error).message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const commitImport = async () => {
+    if (!stagedImport) return;
+    const toImport = stagedImport.questions.filter((_, i) => stagedSel.has(i));
+    if (toImport.length === 0) return showToast('No questions selected', 'error');
+    setLoading(true);
+    try {
+      await apiFetch('/commit-import', { method: 'POST', body: JSON.stringify({ questions: toImport }) });
+      showToast(`Imported ${toImport.length} question${toImport.length !== 1 ? 's' : ''}`);
+      setStagedImport(null);
+      setStagedSel(new Set());
       setMdText('');
       setUploadSource('');
+      void refresh();
     } catch (e) {
       showToast((e as Error).message, 'error');
     }
@@ -172,11 +275,12 @@ export default function App() {
     void refresh();
   };
 
-  const createQ = async (data: DraftQuestion) => {
+  const createQ = async (data: DraftQuestion, force = false) => {
     try {
+      const body = force ? { ...data, force: true } : data;
       const res = await apiFetch<Question>('/questions', {
         method: 'POST',
-        body: JSON.stringify(data),
+        body: JSON.stringify(body),
       });
       setQuestions(qs => [res, ...qs]);
       setComposing(false);
@@ -227,18 +331,44 @@ export default function App() {
   };
 
   // ── PDF generation ─────────────────────────────────────────────────────────
+  const _buildPdfBlob = () => apiBlob('/generate-pdf', {
+    method: 'POST',
+    body: JSON.stringify({ question_ids: [...selected], config: { ...pdfConfig, front_matter: frontMatter } }),
+  });
+
+  const previewPdf = async () => {
+    if (selected.size === 0) return showToast('Select questions first', 'error');
+    setLoading(true);
+    try {
+      const blob = await _buildPdfBlob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (e) {
+      showToast((e as Error).message, 'error');
+    }
+    setLoading(false);
+  };
+
   const generatePdf = async () => {
     if (selected.size === 0) return showToast('Select questions first', 'error');
     setLoading(true);
     try {
-      const blob = await apiBlob('/generate-pdf', {
-        method: 'POST',
-        body: JSON.stringify({ question_ids: [...selected], config: { ...pdfConfig, front_matter: frontMatter } }),
-      });
+      const blob = await _buildPdfBlob();
       const url = URL.createObjectURL(blob);
       Object.assign(document.createElement('a'), { href: url, download: pdfConfig.filename }).click();
       URL.revokeObjectURL(url);
-      showToast('PDF downloaded!');
+      if (saveToArchive) {
+        const title = (archiveName.trim() || pdfConfig.title || 'Untitled Exam');
+        const saved = await apiFetch<ExamRecord>('/exams', {
+          method: 'POST',
+          body: JSON.stringify({ title, question_ids: [...selected], config: pdfConfig }),
+        });
+        setExams(es => [saved, ...es]);
+        showToast(`PDF downloaded & archived as "${title}"`);
+      } else {
+        showToast('PDF downloaded!');
+      }
     } catch (e) {
       showToast((e as Error).message, 'error');
     }
@@ -259,6 +389,8 @@ export default function App() {
     if (f.difficulty && q.difficulty !== f.difficulty) return false;
     if (f.source && q.source !== f.source) return false;
     if (f.lecture && q.lecture !== f.lecture) return false;
+    if (f.answered === 'yes' && !q.correct_answer) return false;
+    if (f.answered === 'no' && !!q.correct_answer) return false;
     return true;
   }), [questions, filters]);
 
@@ -266,6 +398,12 @@ export default function App() {
   const allTopics   = uniq(questions.map(q => q.topic));
   const allSources  = uniq(questions.map(q => q.source));
   const allLectures = uniq(questions.map(q => q.lecture));
+
+  const usageMap = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    exams.forEach(e => e.question_ids.forEach(id => { (map[id] ??= []).push(e.title); }));
+    return map;
+  }, [exams]);
 
   const toggleAll = () => {
     const all = filtered.every(q => selected.has(q.id));
@@ -347,6 +485,80 @@ export default function App() {
               {questions.length} questions · {selected.size} selected
             </p>
           </div>
+
+          {/* Bank switcher */}
+          <div data-bank-picker style={{ position: 'relative', marginLeft: 8 }}>
+            <button onClick={() => setBankPickerOpen(o => !o)} style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '5px 10px', borderRadius: 7, cursor: 'pointer',
+              background: C.accentBg, border: `1px solid ${C.accent}40`,
+              color: C.accent, fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
+            }}>
+              {banks.find(b => b.id === activeBankId)?.name || activeBankId}
+              <span style={{ fontSize: 9, opacity: 0.7 }}>▾</span>
+            </button>
+
+            {bankPickerOpen && (
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 200,
+                minWidth: 240, background: C.surface, border: `1px solid ${C.border}`,
+                borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.18)', padding: 8,
+              }}>
+                <p style={{ fontSize: 10, fontWeight: 650, color: C.textMuted, margin: '0 0 6px 4px', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                  Test Banks
+                </p>
+                {banks.map(b => (
+                  <div key={b.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '7px 8px', borderRadius: 7, marginBottom: 2,
+                    background: b.id === activeBankId ? C.accentBg : 'transparent',
+                    border: `1px solid ${b.id === activeBankId ? C.accent + '40' : 'transparent'}`,
+                  }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: b.id === activeBankId ? C.accent : C.text }}>
+                        {b.name}
+                      </div>
+                      <div style={{ fontSize: 10.5, color: C.textMuted }}>{b.question_count} questions</div>
+                    </div>
+                    {b.id !== activeBankId && (
+                      <Btn sm v="ghost" onClick={() => void switchBank(b.id)}>Switch</Btn>
+                    )}
+                    {b.id === activeBankId && (
+                      <span style={{ fontSize: 10, color: C.accent, fontWeight: 700 }}>Active</span>
+                    )}
+                    {b.id !== activeBankId && (
+                      <Btn sm v="danger" onClick={async () => {
+                        await apiFetch(`/banks/${b.id}`, { method: 'DELETE' });
+                        void refresh();
+                      }}>Del</Btn>
+                    )}
+                  </div>
+                ))}
+
+                <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 8, paddingTop: 8 }}>
+                  <p style={{ fontSize: 10, fontWeight: 650, color: C.textMuted, margin: '0 0 6px 4px', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                    New Bank
+                  </p>
+                  <div style={{ display: 'flex', gap: 5 }}>
+                    <input
+                      value={newBankName}
+                      onChange={e => setNewBankName(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && void createBank()}
+                      placeholder="Bank name…"
+                      style={{
+                        flex: 1, padding: '6px 8px', borderRadius: 6, fontSize: 12,
+                        background: C.bg, border: `1px solid ${C.border}`,
+                        color: C.text, outline: 'none',
+                      }}
+                    />
+                    <Btn sm v="primary" onClick={() => void createBank()} disabled={!newBankName.trim()}>
+                      Create
+                    </Btn>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
         <nav style={{ display: 'flex', gap: 3, alignItems: 'center' }}>
           {([
@@ -386,6 +598,60 @@ export default function App() {
         {view === 'upload' && (
           <div style={{ maxWidth: 580 }}>
             <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 16 }}>Import Exam</h2>
+
+            {/* ── Staging panel ── */}
+            {stagedImport && (
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+                  <span style={{ fontWeight: 700, fontSize: 14, flex: 1 }}>
+                    {stagedImport.questions.length} questions parsed from "{stagedImport.source}"
+                  </span>
+                  <Btn sm v="ghost" onClick={() => {
+                    const all = stagedSel.size === stagedImport.questions.length;
+                    setStagedSel(all ? new Set() : new Set(stagedImport.questions.map((_, i) => i)));
+                  }}>
+                    {stagedSel.size === stagedImport.questions.length ? 'Deselect All' : 'Select All'}
+                  </Btn>
+                  <Btn v="primary" onClick={() => void commitImport()} disabled={loading || stagedSel.size === 0}>
+                    {loading ? 'Importing…' : `Import ${stagedSel.size} Selected`}
+                  </Btn>
+                  <Btn v="ghost" onClick={() => { setStagedImport(null); setStagedSel(new Set()); }}>Cancel</Btn>
+                </div>
+
+                <div style={{ border: `1px solid ${C.border}`, borderRadius: 9, overflow: 'hidden' }}>
+                  {stagedImport.questions.map((q, i) => {
+                    const T = TYPE_MAP[q.type] || TYPES[3];
+                    const checked = stagedSel.has(i);
+                    return (
+                      <div key={i} onClick={() => setStagedSel(s => {
+                        const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n;
+                      })} style={{
+                        padding: '10px 14px', cursor: 'pointer',
+                        background: checked ? C.accentBg : i % 2 === 0 ? C.surface : 'transparent',
+                        borderBottom: `1px solid ${C.border}`,
+                        display: 'flex', gap: 10, alignItems: 'flex-start',
+                      }}>
+                        <Chk checked={checked} onChange={() => {}} style={{ marginTop: 2, pointerEvents: 'none' }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 12.5, color: C.text, marginBottom: 4 }}>
+                            {q.stem.slice(0, 160)}{q.stem.length > 160 ? '…' : ''}
+                          </div>
+                          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                            <Badge color={T.color}>{T.icon} {T.label}</Badge>
+                            {q.correct_answer && <Badge color={C.success}>✓ {q.correct_answer}</Badge>}
+                            {q.points > 0 && <Badge color={C.warn}>{q.points} pts</Badge>}
+                            {q.topic && <Badge color={C.accent}>{q.topic}</Badge>}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ── Normal import form ── */}
+            {!stagedImport && <>
 
             {/* Tab toggle */}
             <div style={{
@@ -555,6 +821,7 @@ export default function App() {
                 </div>
               </div>
             )}
+            </>}
           </div>
         )}
 
@@ -744,16 +1011,85 @@ export default function App() {
                 <option value="">All Lec</option>
                 {allLectures.map(l => <option key={l}>{l}</option>)}
               </Sel>
+              <Sel value={filters.answered} onChange={e => setFilters(f => ({ ...f, answered: e.target.value as Filters['answered'] }))}>
+                <option value="">All Answers</option>
+                <option value="yes">Has Answer</option>
+                <option value="no">No Answer</option>
+              </Sel>
               <div style={{ flex: 1 }} />
+              <Btn sm v="ghost" onClick={() => { setDupScan(null); void scanDuplicates(); }}>
+                {dupScanLoading ? 'Scanning…' : 'Scan for Duplicates'}
+              </Btn>
               <Btn sm v="primary" onClick={() => setComposing(true)}>+ New Question</Btn>
               <span style={{ fontSize: 11.5, color: C.textMuted }}>
                 {filtered.length} of {questions.length}
               </span>
             </div>
 
+            {dupScan !== null && (
+              <div style={{
+                marginBottom: 14, padding: 14, borderRadius: 9,
+                background: C.surface, border: `1px solid ${C.border}`,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+                  <span style={{ fontWeight: 700, fontSize: 13, flex: 1 }}>
+                    Duplicate Scan — {dupScan.length === 0 ? 'No duplicates found' : `${dupScan.length} pair${dupScan.length > 1 ? 's' : ''} found`}
+                  </span>
+                  {dupScan.length > 0 && <>
+                    <Btn sm v="ghost" onClick={() => selectDupsByAge('newer')}>Check older from each pair</Btn>
+                    <Btn sm v="ghost" onClick={() => selectDupsByAge('older')}>Check newer from each pair</Btn>
+                    <Btn sm v="danger" onClick={() => void bulkDeleteDups()}
+                      disabled={dupDeleteSet.size === 0}>
+                      Delete Selected ({dupDeleteSet.size})
+                    </Btn>
+                  </>}
+                  <Btn sm v="ghost" onClick={() => { setDupScan(null); setDupDeleteSet(new Set()); }}>Dismiss</Btn>
+                </div>
+                {dupScan.map((pair, i) => (
+                  <div key={i} style={{
+                    padding: '10px 12px', marginBottom: 8, borderRadius: 7,
+                    background: C.bg, border: `1px solid ${C.border}`, fontSize: 12,
+                  }}>
+                    <span style={{
+                      display: 'inline-block', marginBottom: 6, padding: '1px 7px',
+                      borderRadius: 4, background: `${C.warn}33`,
+                      fontWeight: 700, fontSize: 11, color: C.text,
+                    }}>{Math.round(pair.score * 100)}% match</span>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                      {([pair.a, pair.b] as Question[]).map(q => {
+                        const marked = dupDeleteSet.has(q.id);
+                        return (
+                          <div key={q.id}
+                            onClick={() => toggleDupDelete(q.id)}
+                            style={{
+                              padding: '8px 10px', borderRadius: 5, cursor: 'pointer',
+                              background: marked ? `${C.danger}14` : C.surface,
+                              border: `2px solid ${marked ? C.danger : C.borderSubtle}`,
+                              color: C.textMuted, transition: 'all .1s',
+                            }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                              <div style={{
+                                width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+                                background: marked ? C.danger : 'transparent',
+                                border: `2px solid ${marked ? C.danger : C.border}`,
+                              }} />
+                              <span style={{ fontWeight: 600, color: marked ? C.danger : C.text, fontSize: 11 }}>
+                                {q.source || 'Unknown source'} · {q.topic || 'No topic'}
+                              </span>
+                            </div>
+                            {q.stem.slice(0, 140)}{q.stem.length > 140 ? '…' : ''}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {composing && (
               <QuestionComposer
-                onCreate={q => void createQ(q)}
+                onCreate={(q, force) => void createQ(q, force)}
                 onCancel={() => setComposing(false)}
                 existingTopics={allTopics}
                 existingSources={allSources}
@@ -801,6 +1137,7 @@ export default function App() {
                   onEdit={() => setEditingId(editingId === q.id ? null : q.id)}
                   onUpdate={updateQ}
                   onDelete={() => void deleteQ(q.id)}
+                  usedOn={usageMap[q.id]}
                   even={i % 2 === 0} />
               ))}
             </div>
@@ -877,12 +1214,74 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ marginTop: 22, display: 'flex', gap: 8 }}>
+            <div style={{
+              marginTop: 14, padding: 14, borderRadius: 9,
+              background: C.surface, border: `1px solid ${C.border}`,
+              display: 'flex', flexDirection: 'column', gap: 10,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                <Chk checked={saveToArchive} onChange={() => setSaveToArchive(v => !v)} />
+                <span style={{ fontSize: 12.5 }}>Save to archive after downloading</span>
+              </div>
+              {saveToArchive && (
+                <input
+                  value={archiveName}
+                  onChange={e => setArchiveName(e.target.value)}
+                  placeholder={pdfConfig.title || 'Archive name (defaults to exam title)'}
+                  style={{
+                    padding: '7px 10px', borderRadius: 7, fontSize: 12.5,
+                    background: C.bg, border: `1px solid ${C.border}`,
+                    color: C.text, outline: 'none', width: '100%',
+                  }}
+                />
+              )}
+            </div>
+
+            <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
+              <Btn v="ghost" onClick={() => void previewPdf()} disabled={loading || selected.size === 0}>
+                {loading ? 'Generating...' : `Preview PDF (${selected.size})`}
+              </Btn>
               <Btn v="primary" onClick={() => void generatePdf()} disabled={loading || selected.size === 0}>
                 {loading ? 'Generating...' : `Download PDF (${selected.size})`}
               </Btn>
               <Btn onClick={() => setView('bank')}>← Back</Btn>
             </div>
+
+            {exams.length > 0 && (
+              <div style={{ marginTop: 32 }}>
+                <p style={{
+                  fontSize: 11, fontWeight: 650, color: C.textMuted, marginBottom: 10,
+                  textTransform: 'uppercase', letterSpacing: 0.4,
+                }}>Exam Archive ({exams.length})</p>
+                {exams.map(e => (
+                  <div key={e.id} style={{
+                    padding: '10px 14px', marginBottom: 6, borderRadius: 8,
+                    background: C.surface, border: `1px solid ${C.border}`,
+                    display: 'flex', alignItems: 'center', gap: 10,
+                  }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>{e.title}</div>
+                      <div style={{ fontSize: 11, color: C.textMuted }}>
+                        {e.question_ids.length} questions ·{' '}
+                        {new Date(e.created).toLocaleDateString()}
+                      </div>
+                    </div>
+                    <Btn sm v="ghost" onClick={() => {
+                      const ids = new Set(e.question_ids);
+                      setSelected(ids);
+                      const cfg = e.config as Partial<typeof pdfConfig>;
+                      if (cfg.title) setPdfConfig(c => ({ ...c, ...cfg }));
+                      setArchiveName(e.title);
+                      showToast(`Loaded "${e.title}" — ${e.question_ids.length} questions selected`);
+                    }}>Load</Btn>
+                    <Btn sm v="danger" onClick={async () => {
+                      await apiFetch(`/exams/${e.id}`, { method: 'DELETE' });
+                      setExams(es => es.filter(x => x.id !== e.id));
+                    }}>Del</Btn>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {selQs.length > 0 && (
               <div style={{ marginTop: 28 }}>
